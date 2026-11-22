@@ -1,0 +1,22 @@
+{
+ "2019": {
+  "invested": 41200.0,
+  "value": 124483.6770559696,
+  "multiple": 3.021448472232272,
+  "worst_loss_on_invested": 0.2728634761033063,
+  "lump_sum_multiple": 15.794757875664317,
+  "lump_sum_max_dd": 0.7662925431645935,
+  "lump_cagr": 0.4183697616873798,
+  "daily_sharpe_lump": 0.5661505607019478
+ },
+ "2021": {
+  "invested": 30800.0,
+  "value": 42818.9818222686,
+  "multiple": 1.3902266825411884,
+  "worst_loss_on_invested": 0.5484247965868254,
+  "lump_sum_multiple": 2.044713649980618,
+  "lump_sum_max_dd": 0.7662925431645935,
+  "lump_cagr": 0.1290437412067087,
+  "daily_sharpe_lump": 0.2151888851532659
+ }
+}

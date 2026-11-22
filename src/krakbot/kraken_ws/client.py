@@ -1,0 +1,147 @@
+"""Public WebSocket v2 client (book + trade) with heartbeat deadline, jittered reconnect and resync.
+
+* subscribes `book` (depth, snapshot) and `trade` for the given v2 symbols; `heartbeat` and `status` arrive
+  automatically once connected;
+* any silence longer than `heartbeat_timeout_s` -> the connection is considered dead and is replaced;
+* after EVERY (re)connection all books are discarded and rebuilt from the new snapshot (no delta merging across
+  a gap); `on_book(symbol, None)` is emitted on disconnect so consumers mark the data stale;
+* checksum mismatch -> the book is invalidated and that symbol is resubscribed (fresh snapshot).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import random
+from collections.abc import Awaitable, Callable, Sequence
+from decimal import Decimal
+from typing import Any
+
+import websockets
+
+from krakbot.kraken_rest.clock import Clock, SystemClock
+from krakbot.kraken_ws.book import OrderBook
+
+__all__ = ["WS_URL", "PublicWs"]
+
+WS_URL = "wss://ws.kraken.com/v2"
+log = logging.getLogger("krakbot.kraken_ws")
+
+BookCb = Callable[[str, OrderBook | None], None]
+TradeCb = Callable[[str, list[dict[str, Any]]], None]
+StatusCb = Callable[[dict[str, Any]], None]
+Connect = Callable[[str], Awaitable[Any]]
+
+
+class PublicWs:
+    def __init__(self, symbols: Sequence[str], *, on_book: BookCb, on_trade: TradeCb | None = None,
+                 on_status: StatusCb | None = None, url: str = WS_URL, depth: int = 100,
+                 heartbeat_timeout_s: float = 5.0, max_backoff_s: float = 60.0, connect: Connect | None = None,
+                 clock: Clock | None = None, rng: random.Random | None = None) -> None:
+        if depth not in (10, 25, 100, 500, 1000):
+            raise ValueError("Kraken book depth must be one of 10, 25, 100, 500, 1000")
+        self.symbols = list(symbols)
+        self._on_book, self._on_trade, self._on_status = on_book, on_trade, on_status
+        self._url, self._depth = url, depth
+        self._hb, self._max_backoff = heartbeat_timeout_s, max_backoff_s
+        self._connect = connect or _default_connect
+        self._clock = clock or SystemClock()
+        self._rng = rng or random.Random()  # noqa: S311 - reconnect jitter, not cryptography
+        self.books: dict[str, OrderBook] = {}
+        self.connected = False
+        self.connections = 0
+        self.checksum_failures = 0
+
+    async def run(self, stop: asyncio.Event) -> None:
+        attempt = 0
+        while not stop.is_set():
+            try:
+                ws = await self._connect(self._url)
+                self.connections += 1
+                attempt = 0
+                try:
+                    await self._session(ws, stop)
+                finally:
+                    await _close(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("ws disconnected", extra={"error": type(exc).__name__, "detail": str(exc)[:200]})
+            self._mark_all_stale()
+            if stop.is_set():
+                break
+            delay = min(self._max_backoff, 2.0**attempt) * (0.5 + self._rng.random() / 2)
+            attempt += 1
+            await self._clock.sleep(delay)
+
+    def _mark_all_stale(self) -> None:
+        self.connected = False
+        for sym, book in self.books.items():
+            book.valid = False
+            self._on_book(sym, None)
+
+    async def _subscribe_book(self, ws: Any, symbols: Sequence[str]) -> None:
+        await ws.send(json.dumps({"method": "subscribe", "params": {"channel": "book", "symbol": list(symbols),
+                                                                   "depth": self._depth, "snapshot": True}}))
+
+    async def _session(self, ws: Any, stop: asyncio.Event) -> None:
+        self.books = {s: OrderBook(s, self._depth) for s in self.symbols}
+        await self._subscribe_book(ws, self.symbols)
+        if self._on_trade is not None:
+            await ws.send(json.dumps({"method": "subscribe", "params": {"channel": "trade", "symbol": self.symbols,
+                                                                       "snapshot": False}}))
+        self.connected = True
+        while not stop.is_set():
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=self._hb)
+            except TimeoutError as exc:
+                raise ConnectionError(f"no message for {self._hb}s (heartbeat deadline)") from exc
+            msg = json.loads(raw, parse_float=Decimal)
+            await self._handle(ws, msg)
+
+    async def _handle(self, ws: Any, msg: dict[str, Any]) -> None:
+        ch = msg.get("channel")
+        if ch == "book":
+            for d in msg.get("data", []):
+                sym = d["symbol"]
+                book = self.books.get(sym)
+                if book is None:
+                    continue
+                if msg.get("type") == "snapshot":
+                    book.snapshot(d.get("bids", []), d.get("asks", []))
+                elif book.valid:
+                    book.update(d.get("bids", []), d.get("asks", []))
+                else:
+                    continue  # waiting for the snapshot after a resubscribe
+                if "checksum" in d and book.checksum() != int(d["checksum"]):
+                    self.checksum_failures += 1
+                    book.valid = False
+                    self._on_book(sym, None)
+                    log.warning("book checksum mismatch: resubscribing", extra={"symbol": sym})
+                    await ws.send(json.dumps({"method": "unsubscribe", "params": {"channel": "book", "symbol": [sym],
+                                                                                 "depth": self._depth}}))
+                    await self._subscribe_book(ws, [sym])
+                    continue
+                self._on_book(sym, book)
+        elif ch == "trade" and self._on_trade is not None:
+            by_sym: dict[str, list[dict[str, Any]]] = {}
+            for t in msg.get("data", []):
+                by_sym.setdefault(t["symbol"], []).append(t)
+            for sym, trades in by_sym.items():
+                self._on_trade(sym, trades)
+        elif ch == "status" and self._on_status is not None:
+            for d in msg.get("data", []):
+                self._on_status(d)
+        elif msg.get("method") == "subscribe" and msg.get("success") is False:
+            raise ConnectionError(f"subscription rejected: {msg.get('error')}")
+
+
+async def _default_connect(url: str) -> Any:
+    return await websockets.connect(url, open_timeout=10, ping_interval=20, ping_timeout=20, max_size=2**22)
+
+
+async def _close(ws: Any) -> None:
+    with contextlib.suppress(Exception):  # closing a dead socket may fail; nothing to do
+        await ws.close()

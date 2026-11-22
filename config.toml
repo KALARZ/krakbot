@@ -1,0 +1,101 @@
+# krakbot strategy & limits configuration (versioned; secrets live in .env).
+# Every value is range-checked at startup (src/krakbot/config.py); out-of-range => the bot refuses to start.
+# Rationale and numbers for each value: docs/research.md §F, docs/plan.md §6.
+
+[general]
+quote = "EUR"
+data_dir = "data"
+db_file = "krakbot.db"
+log_level = "INFO"
+
+[risk]
+# Scope: Donchian book only (DCA never reads [risk]; the kill-switch flatten never sells DCA holdings: plan §6).
+risk_per_trade = "0.005"          # 0.25%–1% allowed; sizing from stop distance
+max_total_exposure = "0.30"       # <= 30% of equity
+max_position_exposure = "0.15"
+max_positions = 3                 # 1–3
+kill_total_drawdown = "0.15"      # flatten + HALT (manual resume --ack-drawdown); <= 20%
+kill_daily_loss = "0.04"          # flatten + HALT (manual resume)
+breaker_half_after = 3            # consecutive losses -> size x0.5 until a win
+breaker_pause_after = 5           # consecutive losses -> no entries for breaker_pause_hours, then x0.5
+breaker_pause_hours = 24
+cooldown_bars = 2                 # per pair, after a stop-loss exit
+min_order_safety_factor = "1.5"   # notional must be >= 1.5 x max(ordermin*price, costmin)
+
+[execution]
+entry_reprice_seconds = 60
+entry_max_reprices = 3
+entry_gtd_seconds = 90            # entries die server-side even if the bot dies
+max_chase = "0.0025"
+exit_reprice_seconds = 60
+exit_max_reprices = 3
+deadline_seconds = 10             # Kraken accepts now+2s .. now+60s
+stop_trigger = "last"
+dms_mode = "entry_only"           # "entry_only" (default, see plan §5) or "always" (as originally specified)
+dms_timeout_seconds = 60
+dms_refresh_seconds = 20
+
+[liquidity]
+# Scope: Donchian entries. Per-pair thresholds are DERIVED from the 7 clean DRY_RUN days (plan §6) and replace the
+# 30-minute sample of docs/research.md; they are frozen into the forward-test hash at start.
+reference_days = 7
+sample_seconds = 10               # top-of-book sampled every 10 s (fixed interval: no bias toward busy moments)
+spread_percentile = 95            # entry allowed only if spread <= p95 of the pair's 7-day samples
+depth_bps = 25
+depth_percentile = 5              # ... and depth within 25 bp >= max(p5 of 7-day samples, depth_mult_min x notional)
+depth_mult_min = "10"
+min_sample_coverage = "0.90"      # a pair with < 90% of expected samples is excluded until enough data exists
+sample_pairs = ["XBT/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR", "XDG/EUR", "ADA/EUR", "LINK/EUR", "LTC/EUR"]  # DCA pair + top EUR candidates
+
+[monitor]
+telegram_enabled = true
+heartbeat_seconds = 60
+ws_down_alert_seconds = 30
+
+[live_gate]
+dry_run_clean_days = 7            # DCA live only after >= 7 consecutive clean DRY_RUN days
+min_heartbeat_coverage = "0.99"
+
+[strategies.dca]
+mode = "dry_run"                  # off | dry_run | live
+pair = "XBT/EUR"
+allocation = "0.20"               # of CAPITAL; 0.20 x 76.6% (BTC max DD in sample) = 15.3% account DD
+tranches = 52
+weekday = 0                       # Monday
+hour_utc = 10
+reprice_seconds = 300            # each maker order is GTD for this long, then re-placed at the bid for the remainder
+tranche_window_hours = 24        # after the window: unfilled budget carried to next week (never market)
+max_chase = "0.02"               # never bid above 2% over the mid at window open
+max_tranche_multiple = 2         # weekly budget incl. carry-over capped at 2 x nominal tranche
+stall_alert_weeks = 4            # consecutive UNFILLED weeks -> DCA_STALLED alert
+min_tranche_safety_factor = "1.5" # startup: tranche must be >= 1.5 x max(ordermin*price, costmin), else fewer tranches
+pause_spread_percentile = 99      # no NEW DCA order while spread > p99 of XBT/EUR 7-day samples (once derived)
+kill_switch_sells_holdings = false  # confirmed decision: drawdown kill switches never sell DCA BTC (plan §6)
+
+[strategies.donchian]
+mode = "dry_run"                  # forward test only: "live" is rejected by the validator
+timeframe = "4h"
+channel_bars = 50
+k_stop_atr = "2.5"
+k_trail_atr = "3.5"
+regime_sma_bars = 200
+universe_size = 4                 # point-in-time top-N Kraken EUR pairs by 90d volume (user constraint 2–4)
+max_hold_hours = 48
+paper_capital_fraction = "0.80"   # simulated capital = 80% of CAPITAL (the part not allocated to DCA)
+
+[forward_test]
+# Pre-registered (docs/plan.md §0.2). The validator only accepts these exact values: changing them is a code change.
+reading_fee_tier = 1              # all forward-test metrics at Tier 1 fees (0.40% maker / 0.80% taker)
+slippage_bp = 5
+checkpoint_trades = 100           # single interim decision point
+abandon_if_pf_below = "1.0"       # PF(T1) < 1.0 at the checkpoint -> forward test closed
+abandon_on_total_kill = true
+unlock_min_trades = 300
+unlock_min_pf = "1.3"
+unlock_min_sharpe = "1.0"
+unlock_max_drawdown = "0.20"
+unlock_min_positive_months = "0.80"
+unlock_fee_stress_mult = 2
+secondary_hypothesis_alpha = "0.05"
+secondary_hypothesis_statistic = "welch_t_one_sided_ret_t1"   # src/krakbot/forward_test.py::secondary_hypothesis
+secondary_hypothesis_split = "rank_halves_by_stop_pct"        # first 100 closed trades, ranks 1-50 vs 51-100

@@ -1,0 +1,32 @@
+{
+ "LINKEUR": {
+  "signals": 236,
+  "fill_proxy": 0.9915254237288136,
+  "fill_native": 0.9364406779661016,
+  "both": 219,
+  "gross_proxy_pct": -2.186263652700609,
+  "gross_native_pct": -2.1212155089842666,
+  "delta_gross_bp_mean": 6.50481437163424,
+  "delta_gross_bp_median": 0.0,
+  "maker_exit_proxy": 0.365296803652968,
+  "maker_exit_native": 0.3789954337899543,
+  "gross_of_missed_on_native_pct": -1.7182124030521277,
+  "native_bar_coverage": 0.9064492999735839,
+  "days": 92.00694444444444
+ },
+ "XDGEUR": {
+  "signals": 207,
+  "fill_proxy": 0.9903381642512077,
+  "fill_native": 0.9420289855072463,
+  "both": 194,
+  "gross_proxy_pct": -1.5677330894828094,
+  "gross_native_pct": -1.6541772285847565,
+  "delta_gross_bp_mean": -8.64441391019467,
+  "delta_gross_bp_median": -2.6020988004549217,
+  "maker_exit_proxy": 0.3917525773195876,
+  "maker_exit_native": 0.36082474226804123,
+  "gross_of_missed_on_native_pct": 0.11114607200491046,
+  "native_bar_coverage": 0.8910861197071477,
+  "days": 92.00347222222223
+ }
+}
