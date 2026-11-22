@@ -10,7 +10,8 @@
 *.db-shm
 *.log
 
-# research downloads (large, re-downloadable with research/scripts)
+# research downloads: NOT preserved (decision 2026-11-22, docs/research.md section J). Binance history is
+# re-downloadable; the Kraken native candles/book sample/trades of 2026-11-22 and docs_raw are not.
 /research/data/
 /research/docs_raw/
 

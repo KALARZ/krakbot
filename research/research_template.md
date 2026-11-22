@@ -221,4 +221,6 @@ python3 -I scripts/wf2_diag.py donchian,squeeze,tsmom,impulse,mr_dip
 python3 -I scripts/kraken_trades.py <coppie> 92 && python3 -I scripts/fidelity.py
 python3 -I scripts/dca.py && python3 -I scripts/report_wf2.py && python3 -I scripts/build_docs.py
 ```
-Tutti i passaggi sono deterministici (nessun campionamento casuale); i dati scaricati sono in `research/data/`.
+Tutti i passaggi sono deterministici (nessun campionamento casuale).
+
+**Dati grezzi non conservati (decisione del 2026-11-22).** I 368 MB di `research/data/` e le copie delle doc Kraken in `research/docs_raw/` esistevano solo nel container di lavoro e non sono stati salvati. Restano in git gli script, i risultati in `research/out/` e questo dossier. Riscaricabili: lo storico Binance (archivi pubblici mensili e giornalieri, immutabili). **Non** riscaricabili identici: le 720 candele native Kraken (finestra mobile), il campione di book Kraken del 2026-11-22, i trade Kraken paginati di quella finestra e il testo delle doc Kraken come era quel giorno. Rieseguire gli script oggi dà numeri su dati nuovi, non una verifica bit per bit di quelli citati qui.
