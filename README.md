@@ -28,16 +28,44 @@ Lo stato dei lavori e le regole sono in `docs/plan.md`. La ricerca che ha portat
 
 ## Installazione sul VPS
 
+Il repository è privato: sul VPS serve una **deploy key** in sola lettura. Generala sul VPS, aggiungila su GitHub in *Settings → Deploy keys* del repository, **senza** "Allow write access":
+
+```bash
+sudo ssh-keygen -t ed25519 -N "" -f /root/.ssh/krakbot_deploy && sudo cat /root/.ssh/krakbot_deploy.pub
+```
+
 ```bash
 sudo apt-get update && sudo apt-get install -y python3 python3-venv git chrony
 ```
+
+```bash
+sudo GIT_SSH_COMMAND="ssh -i /root/.ssh/krakbot_deploy -o IdentitiesOnly=yes" git clone git@github.com:KALARZ/krakbot.git /opt/krakbot
+```
+
+Poi tutto il resto con un solo comando: crea l'utente, il venv, il `.env` (permessi 600, **senza chiavi Kraken**), installa le unità e avvia DRY_RUN, backup e run ombra. Rifiuta di partire se nel `.env` trova chiavi Kraken.
+
+```bash
+sudo CAPITAL=5000 /opt/krakbot/deploy/install_vps.sh --with-shadow
+```
+
+Per gli allarmi Telegram e l'heartbeat esterno (consigliati, vedi sotto) modifica il `.env` e riavvia, **prima** che inizi il primo giorno UTC completo, così il riavvio non costa uptime a un giorno che conta:
+
+```bash
+sudo -u krakbot nano /opt/krakbot/.env
+```
+
+```bash
+sudo systemctl restart krakbot
+```
+
+I passi manuali equivalenti, se preferisci farli uno per uno:
 
 ```bash
 sudo useradd --system --home-dir /opt/krakbot --shell /usr/sbin/nologin krakbot
 ```
 
 ```bash
-sudo git clone <URL-del-repo> /opt/krakbot && sudo chown -R krakbot:krakbot /opt/krakbot
+sudo chown -R krakbot:krakbot /opt/krakbot
 ```
 
 ```bash
@@ -53,7 +81,7 @@ sudo -u krakbot install -m 600 /opt/krakbot/.env.example /opt/krakbot/.env
 ```
 
 ```bash
-sudo -u krakbot mkdir -p /opt/krakbot/data
+sudo -u krakbot mkdir -p /opt/krakbot/data /opt/krakbot/data-shadow
 ```
 
 In `/opt/krakbot/.env` imposta `CAPITAL` (EUR). Per i 7 giorni di DRY_RUN **lascia vuote le chiavi Kraken**: non servono. Consigliati: `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` per gli allarmi, e `HEALTHCHECK_URL` di un servizio di heartbeat esterno. Un processo morto non può avvisarti: lo può fare solo il servizio esterno, che non riceve più ping.
@@ -62,14 +90,14 @@ In `/opt/krakbot/.env` imposta `CAPITAL` (EUR). Per i 7 giorni di DRY_RUN **lasc
 sudo -u krakbot nano /opt/krakbot/.env
 ```
 
-Servizio DRY_RUN e backup giornaliero:
+Servizio DRY_RUN, backup giornaliero e run ombra:
 
 ```bash
-sudo cp /opt/krakbot/deploy/systemd/krakbot.service /opt/krakbot/deploy/systemd/krakbot-backup.service /opt/krakbot/deploy/systemd/krakbot-backup.timer /etc/systemd/system/
+sudo cp /opt/krakbot/deploy/systemd/krakbot.service /opt/krakbot/deploy/systemd/krakbot-backup.service /opt/krakbot/deploy/systemd/krakbot-backup.timer /opt/krakbot/deploy/systemd/krakbot-shadow.service /etc/systemd/system/
 ```
 
 ```bash
-sudo systemctl daemon-reload && sudo systemctl enable --now krakbot.service krakbot-backup.timer
+sudo systemctl daemon-reload && sudo systemctl enable --now krakbot.service krakbot-backup.timer krakbot-shadow.service
 ```
 
 Verifica:
@@ -103,6 +131,7 @@ alias kb='sudo -u krakbot /opt/krakbot/.venv/bin/krakbot --config /opt/krakbot/c
 | `kb resolve <cl_ord_id> [--dry]` | risolve un ordine dubbio con l'evidenza di Kraken (§4.7) |
 | `kb canary-verify <tranche_id> [--yes]` | verifica una tranche canary live: fill, registro, riconciliazione, saldo |
 | `kb backup <file>` | copia coerente del DB anche a bot acceso |
+| `kb shadow-report` | cosa ha già esercitato la run ombra oraria (repricing, scadenze GTD, parziali, riporto) |
 
 Le procedure operative (controlli giornalieri, incidenti, passaggio al live) sono in **`docs/runbook.md`**.
 
@@ -131,7 +160,9 @@ src/krakbot/
   state/             SQLite WAL, migrazioni con checksum, repository, gate del giorno pulito
   monitor/           log JSON con redazione, Telegram, heartbeat systemd/esterno
   app.py, cli.py     composizione e comandi
-deploy/systemd/      unità DRY_RUN, LIVE (mutuamente esclusive), backup
+  shadow.py          run ombra a calendario orario: DB proprio, solo WebSocket, mai nel gate
+deploy/systemd/      unità DRY_RUN, LIVE (mutuamente esclusive), ombra oraria, backup
+deploy/install_vps.sh  installazione idempotente sul VPS (DRY_RUN senza chiavi)
 docs/                research.md, plan.md, runbook.md
 research/            script e risultati della Fase 0 (i dati scaricati non sono in git)
 ```

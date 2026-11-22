@@ -1,0 +1,57 @@
+# krakbot SHADOW: the DCA rules on hourly windows, DRY_RUN, on its OWN database (/opt/krakbot/data-shadow).
+# WebSocket only (zero REST calls), no liquidity sampling, never read by the 7-day gate (plan §5.4).
+# Runs at low priority so the main DRY_RUN instance never loses a sample to it.
+[Unit]
+Description=krakbot SHADOW - compressed-calendar DRY_RUN (own DB, WebSocket only)
+Documentation=file:///opt/krakbot/docs/runbook.md
+Wants=network-online.target
+After=network-online.target time-sync.target krakbot.service
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=krakbot
+Group=krakbot
+WorkingDirectory=/opt/krakbot
+ExecStart=/opt/krakbot/.venv/bin/krakbot --config /opt/krakbot/config.toml --env /opt/krakbot/.env shadow
+Restart=on-failure
+RestartPreventExitStatus=2
+# slow restarts: every restart is a new WebSocket connection from the shared IP
+RestartSec=60
+WatchdogSec=120
+TimeoutStartSec=120
+TimeoutStopSec=30
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+
+# lower priority than krakbot.service on CPU, I/O and memory pressure
+Nice=10
+CPUWeight=20
+IOWeight=20
+MemoryHigh=256M
+MemoryMax=384M
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/krakbot/data-shadow
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -88,6 +88,18 @@ universe_size = 4                 # point-in-time top-N Kraken EUR pairs by 90d 
 max_hold_hours = 48
 paper_capital_fraction = "0.80"   # simulated capital = 80% of CAPITAL (the part not allocated to DCA)
 
+[shadow]
+# Compressed-calendar DRY_RUN of the DCA rules (plan §5.4), a SEPARATE process (`krakbot shadow`) on its OWN database.
+# WebSocket only (zero REST calls: the public REST limit is per IP and shared with the main instance), no liquidity
+# sampling, never read by the gate. Same DCA rules and nominal tranche as [strategies.dca], hourly windows.
+data_dir = "data-shadow"
+period_minutes = 60               # a new tranche every hour ...
+window_minutes = 45               # ... open for 45 min (+ GTD expiry) so it always closes before the next one
+tranches = 240                    # 10 days of hourly tranches (paper budget = 240 x the real nominal tranche)
+book_depth = 10
+max_connects_per_10min = 6        # Cloudflare: ~150 WS connection attempts per IP per 10 min, then a 10-min IP ban
+min_reconnect_seconds = 30
+
 [forward_test]
 # Pre-registered (docs/plan.md §0.2). The validator only accepts these exact values: changing them is a code change.
 reading_fee_tier = 1              # all forward-test metrics at Tier 1 fees (0.40% maker / 0.80% taker)

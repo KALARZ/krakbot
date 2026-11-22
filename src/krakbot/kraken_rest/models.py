@@ -13,7 +13,8 @@ from krakbot.domain import OrderType, Side
 from krakbot.numeric import D, step_from_decimals, to_db
 
 __all__ = [
-    "AddOrderRequest", "BookTop", "Instrument", "LocalValidationError", "merge_display_symbols", "parse_asset_pairs",
+    "AddOrderRequest", "BookTop", "Instrument", "LocalValidationError", "instrument_from_ws_v2",
+    "merge_display_symbols", "parse_asset_pairs",
     "parse_ticker", "valid_cl_ord_id",
 ]
 
@@ -70,6 +71,22 @@ def merge_display_symbols(by_wsname: dict[str, Instrument], display_result: dict
         sym = sym_by_alt.get(inst.altname, "")
         out[ws] = Instrument(**{**inst.__dict__, "symbol": sym})
     return out
+
+
+def instrument_from_ws_v2(pair: dict[str, Any], wsname: str) -> Instrument:
+    """Instrument from a WS v2 `instrument` channel pair (REST-free consumers, e.g. the shadow run). The REST keys
+    are unknown on this path and left empty: such an Instrument is only for the paper broker."""
+    def dec(k: str) -> Decimal:
+        v = pair[k]
+        return v if isinstance(v, Decimal) else D(str(v))
+    inst = Instrument(rest_key="", altname="", wsname=wsname, base=str(pair["base"]), quote=str(pair["quote"]),
+                      pair_decimals=int(pair["price_precision"]), lot_decimals=int(pair["qty_precision"]),
+                      cost_decimals=int(pair["cost_precision"]), tick_size=dec("price_increment"),
+                      ordermin=dec("qty_min"), costmin=dec("cost_min"), status=str(pair.get("status", "unknown")),
+                      symbol=str(pair["symbol"]))
+    if inst.tick_size <= 0 or inst.ordermin <= 0 or inst.costmin < 0:
+        raise ValueError(f"instrument {inst.symbol}: non-positive increment/qty_min or negative cost_min")
+    return inst
 
 
 def parse_asset_pairs(result: dict[str, Any]) -> dict[str, Instrument]:

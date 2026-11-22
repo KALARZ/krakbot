@@ -56,7 +56,8 @@ class DcaEngine:
     def __init__(self, *, settings: Settings, store: Store, dca: DcaRepo, liq: LiquidityRepo, md: MarketData,
                  broker: Broker, inst: Instrument, mode: Mode, plan: DcaPlan, fee_rate: Callable[[], Decimal],
                  alerts: Alerts, now_ms: Callable[[], int], poll_ms: int = 1_000,
-                 dms: DmsController | None = None) -> None:
+                 dms: DmsController | None = None,
+                 schedule: Callable[[int], tuple[int, int]] | None = None) -> None:
         self.cfg = settings.app.strategies.dca
         self.exe = settings.app.execution
         self.store, self.dca, self.liq, self.md, self.broker = store, dca, liq, md, broker
@@ -64,6 +65,8 @@ class DcaEngine:
         self.now = now_ms
         self.poll_ms = poll_ms
         self.dms = dms
+        self.schedule = schedule or (lambda now: window_at(now, weekday=self.cfg.weekday, hour_utc=self.cfg.hour_utc,
+                                                           window_hours=self.cfg.tranche_window_hours))
         self.pair = inst.wsname
         self.last_wait: WaitReason | None = None
         self._last_poll: dict[str, int] = {}
@@ -181,8 +184,7 @@ class DcaEngine:
 
     # ------------------------------------------------------------------ tranche lifecycle
     async def _manage_tranche(self, now: int) -> None:
-        start, end = window_at(now, weekday=self.cfg.weekday, hour_utc=self.cfg.hour_utc,
-                               window_hours=self.cfg.tranche_window_hours)
+        start, end = self.schedule(now)
         t = self.dca.open_tranche(self.mode)
         if t is not None:
             await self._manage_open(t, now)

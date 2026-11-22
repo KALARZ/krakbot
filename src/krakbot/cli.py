@@ -13,6 +13,8 @@ needs a hand-edited database.
   krakbot gate                            7-clean-days DRY_RUN gate for live DCA
   krakbot canary-verify TRANCHE_ID [--yes] verify a closed LIVE canary tranche (fill, ledger, recon, balance)
   krakbot backup PATH                     consistent online copy of the database (safe while the bot runs)
+  krakbot shadow                          compressed-calendar DRY_RUN on its own DB (WebSocket only, no gate)
+  krakbot shadow-report                   what the shadow has exercised so far (repricing, carry, partials, GTD)
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from typing import TextIO
 
 import httpx
 
-from krakbot.app import DCA_PAIR, DRY_RUN_MAKER_FEE, App, LiveGateError
+from krakbot.app import DCA_PAIR, DRY_RUN_MAKER_FEE, App, BootAborted, LiveGateError
 from krakbot.config import ConfigError, Settings, load_settings
 from krakbot.domain import EventLevel, Mode
 from krakbot.execution.canary_verify import CanaryNotVerifiable, verify_canary
@@ -46,6 +48,8 @@ from krakbot.kraken_rest.nonce import NonceSource, SqliteNonceStore
 from krakbot.market_data import MarketData
 from krakbot.monitor.alerts import Alerts, NullAlerts, TelegramAlerts
 from krakbot.monitor.logs import configure_logging
+from krakbot.shadow import ShadowApp, ShadowIsolationError
+from krakbot.shadow_report import shadow_report
 from krakbot.state import connect, migrate
 from krakbot.state.canary import CANARY_CLEAN_TRANCHES, CanaryRepo
 from krakbot.state.dca import DcaRepo
@@ -117,10 +121,13 @@ async def _run(ctx: _Ctx, *, live: bool) -> int:
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as http:
         app = App(s, live=live, http=http, alerts=_alerts(s, http, ctx.now), now_ms=ctx.now)
         try:
-            await app.start()
+            await app.start(stop)
         except LiveGateError as exc:
             ctx.p(f"REFUSED: {exc}")
             return EXIT_REFUSED
+        except BootAborted:
+            await app.close(clean=True, reason="stopped during startup")
+            return EXIT_OK
         clean, reason = True, "signal"
         try:
             await app.run(stop)
@@ -129,6 +136,56 @@ async def _run(ctx: _Ctx, *, live: bool) -> int:
             raise
         finally:
             await app.close(clean=clean, reason=reason)
+    return EXIT_OK
+
+
+async def _shadow(ctx: _Ctx) -> int:
+    s = ctx.settings
+    configure_logging(s.app.general.log_level)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, stop.set)
+    try:
+        app = ShadowApp(s, now_ms=ctx.now)
+    except ShadowIsolationError as exc:
+        ctx.p(f"REFUSED: {exc}")
+        return EXIT_REFUSED
+    await app.start()
+    clean, reason = True, "signal"
+    try:
+        await app.run(stop)
+    except Exception as exc:  # pragma: no cover - re-raised so systemd restarts the shadow
+        clean, reason = False, f"crash: {type(exc).__name__}"
+        raise
+    finally:
+        await app.close(clean=clean, reason=reason)
+    return EXIT_OK
+
+
+def cmd_shadow(ctx: _Ctx) -> int:
+    return asyncio.run(_shadow(ctx))
+
+
+def cmd_shadow_report(ctx: _Ctx) -> int:
+    path = ctx.settings.shadow_db_path
+    if not path.exists():
+        ctx.p(f"no shadow database at {path} (start `krakbot shadow` first)")
+        return EXIT_ERROR
+    conn = connect(path)
+    try:
+        r = shadow_report(conn, ctx.now())
+    finally:
+        conn.close()
+    ctx.p(f"shadow since {_utc(r['since'])}: uptime {r['uptime']}  runs {r['runs']} (unclean {r['unclean_runs']})  "
+          f"recon {r['recon_ok']}/{r['recon']}  halts {r['halts']}")
+    ctx.p("tranches: " + ", ".join(f"{k} {v}" for k, v in sorted(r["tranches"].items())) + f"  (carry-in > 0: "
+          f"{r['carry_in_tranches']})")
+    ctx.p("orders:   " + ", ".join(f"{k} {v}" for k, v in sorted(r["orders"].items())))
+    ctx.p(f"fills {r['fills']}  spent {r['spent']} EUR  bought {r['qty']} BTC")
+    for name, n in r["coverage"].items():
+        ctx.p(f"  {name:<22} {'COVERED' if n else 'not yet'} ({n})")
     return EXIT_OK
 
 
@@ -487,6 +544,8 @@ def build_parser() -> argparse.ArgumentParser:
     cv.add_argument("tranche_id")
     cv.add_argument("--yes", action="store_true")
     cv.set_defaults(fn=cmd_canary_verify)
+    sub.add_parser("shadow").set_defaults(fn=cmd_shadow)
+    sub.add_parser("shadow-report").set_defaults(fn=cmd_shadow_report)
     bk = sub.add_parser("backup")
     bk.add_argument("path")
     bk.set_defaults(fn=cmd_backup)

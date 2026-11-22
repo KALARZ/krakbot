@@ -241,6 +241,19 @@ class ForwardTest(_Strict):
         return self
 
 
+class Shadow(_Strict):
+    """Compressed-calendar DRY_RUN of the DCA rules (plan §5.4): own database, WebSocket only (no REST: the public
+    REST limit is per IP and shared with the main instance), no liquidity sampling, never read by the gate."""
+
+    data_dir: Path = Path("data-shadow")
+    period_minutes: int = Field(default=60, ge=15, le=1440)
+    window_minutes: int = Field(default=45, ge=5, le=1440)
+    tranches: int = Field(default=240, ge=24, le=10_000)   # 240 hourly tranches = 10 days, longer than the 7
+    book_depth: Literal[10, 25] = 10
+    max_connects_per_10min: int = Field(default=6, ge=1, le=20)
+    min_reconnect_seconds: int = Field(default=30, ge=5, le=600)
+
+
 class Strategies(_Strict):
     dca: Dca
     donchian: Donchian
@@ -255,11 +268,22 @@ class AppConfig(_Strict):
     live_gate: LiveGate
     strategies: Strategies
     forward_test: ForwardTest = ForwardTest()
+    shadow: Shadow = Shadow()
 
     @model_validator(mode="after")
     def _capital_split(self) -> AppConfig:
         if self.strategies.dca.allocation + self.strategies.donchian.paper_capital_fraction > 1:
             raise ValueError("dca.allocation + donchian.paper_capital_fraction must be <= 1")
+        return self
+
+    @model_validator(mode="after")
+    def _shadow_is_separate_and_fits(self) -> AppConfig:
+        sh = self.shadow
+        if sh.data_dir == self.general.data_dir:
+            raise ValueError("shadow.data_dir must differ from general.data_dir: the shadow never touches the main DB")
+        if sh.window_minutes * 60 + 2 * self.strategies.dca.reprice_seconds > sh.period_minutes * 60:
+            raise ValueError("shadow: window + 2 x reprice_seconds must fit in the period (the tranche must close "
+                             "before the next window opens)")
         return self
 
     @model_validator(mode="after")
@@ -321,6 +345,11 @@ class Settings(BaseModel):
         d = self.app.general.data_dir
         return (d if d.is_absolute() else self.root / d) / self.app.general.db_file
 
+    @property
+    def shadow_db_path(self) -> Path:
+        d = self.app.shadow.data_dir
+        return (d if d.is_absolute() else self.root / d) / "shadow.db"
+
     def modes(self) -> dict[str, Mode]:
         return {"dca": self.app.strategies.dca.mode, "donchian": self.app.strategies.donchian.mode}
 
@@ -351,6 +380,7 @@ FREEZE_EXCLUDED: dict[str, frozenset[str]] = {
     "general": frozenset(General.model_fields),
     "monitor": frozenset(Monitor.model_fields),
     "live_gate": frozenset(LiveGate.model_fields),
+    "shadow": frozenset(Shadow.model_fields),
 }
 
 

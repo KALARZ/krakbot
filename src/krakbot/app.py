@@ -42,7 +42,7 @@ from krakbot.state.liquidity import LiquidityRepo
 from krakbot.state.repo import Store
 from krakbot.strategies.dca import DcaPlan, plan
 
-__all__ = ["DRY_RUN_MAKER_FEE", "App", "LiveGateError"]
+__all__ = ["DRY_RUN_MAKER_FEE", "App", "BootAborted", "LiveGateError"]
 
 log = logging.getLogger("krakbot.app")
 DRY_RUN_MAKER_FEE = Decimal("0.0040")  # Tier 1 maker, pre-registered for DRY_RUN (plan §0.1)
@@ -51,6 +51,10 @@ DCA_PAIR = "XBT/EUR"
 
 
 class LiveGateError(RuntimeError):
+    pass
+
+
+class BootAborted(RuntimeError):
     pass
 
 
@@ -69,9 +73,15 @@ class App:
         self._last = {"heartbeat": -1, "watchdog": 0, "recon": 0, "fee": 0, "rest_fallback": 0, "asset_pairs": 0}
         self.loop_errors = 0
         self.healthy = False
+        self.boot_failures = 0
+        self.boot_backoff_s = (5.0, 60.0)
 
     # ------------------------------------------------------------------ setup
-    async def start(self) -> None:
+    async def start(self, stop: asyncio.Event | None = None) -> None:
+        """DB + run registration, then the network bootstrap. Kraken unreachable at boot (VPS reboot before the
+        network is up, Kraken maintenance) must NOT crash the process: systemd would give up after 5 restarts and
+        the bot would stay dead. The bootstrap is retried with backoff until it works or `stop` is set; systemd is
+        told READY + STATUS meanwhile, and no heartbeat is written (the downtime counts against the uptime)."""
         self.conn = connect(self.s.db_path)
         migrate(self.conn)
         self.store = Store(self.conn, self.now)
@@ -86,6 +96,33 @@ class App:
             self.private = KrakenRestClient(http=self.http, api_key=sec.KRAKEN_API_KEY,
                                             api_secret=sec.KRAKEN_API_SECRET,
                                             nonce=NonceSource(SqliteNonceStore(self.conn)), trading_enabled=self.live)
+        delay, (lo, hi) = 0.0, self.boot_backoff_s
+        while True:
+            try:
+                await self._bootstrap()
+                break
+            except (KrakenError, OSError, httpx.HTTPError) as exc:
+                delay = min(hi, max(lo, delay * 2))
+                self.boot_failures += 1
+                log.warning("Kraken unreachable at startup: retrying", extra={"error": str(exc)[:200],
+                                                                             "retry_in_s": delay})
+                sd_notify(f"READY=1\nWATCHDOG=1\nSTATUS=waiting for Kraken ({type(exc).__name__}), retry in "
+                          f"{delay:.0f}s")
+                if self.boot_failures == 1:
+                    await self.alerts.send(f"Kraken unreachable at startup ({exc}); retrying", key="boot-wait",
+                                           level=AlertLevel.WARNING, repeat_after_s=1800)
+                if stop is None:
+                    await asyncio.sleep(delay)
+                else:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(stop.wait(), timeout=delay)
+                    if stop.is_set():
+                        raise BootAborted("stopped while waiting for Kraken at startup") from exc
+        sd_notify("READY=1\nSTATUS=running")
+        await self.alerts.send(f"started ({self.mode}), run {self.run_id[:8]}", level=AlertLevel.INFO)
+
+    async def _bootstrap(self) -> None:
+        sec = self.s.secrets
         await self._load_market()
         self.md = MarketData(self.instruments, depth_bps=self.s.app.liquidity.depth_bps, now_ms=self.now)
         self.liq = LiquidityRepo(self.conn, self.now)
@@ -98,8 +135,6 @@ class App:
         self.ping = ExternalPing(self.http, sec.HEALTHCHECK_URL)
         reconcile_dca(self.store, self.dca, self.mode, total_budget=self.plan.total_budget)
         self._last["recon"] = self.now()
-        sd_notify("READY=1")
-        await self.alerts.send(f"started ({self.mode}), run {self.run_id[:8]}", level=AlertLevel.INFO)
 
     async def _load_market(self) -> None:
         """AssetPairs (precisions/minimums) for the sampled pairs and the DCA plan from the live minimum."""

@@ -51,6 +51,28 @@ Che cosa rompe un giorno pulito, e cosa fare:
 
 **Durante i 7 giorni evita riavvii e aggiornamenti.** Un `systemctl restart` è un'uscita pulita, ma costa circa un minuto di uptime. Un riavvio della macchina è pulito se systemd ferma il servizio con SIGTERM.
 
+### Run ombra (in parallelo, facoltativa)
+La run ombra applica le stesse regole DCA con una tranche **ogni ora**: in 7 giorni esercita repricing, scadenze GTD, fill parziali e riporto molte volte invece di una (plan §5.4).
+- Ha un DB proprio (`data-shadow/shadow.db`) e **non entra mai nel gate**: i suoi problemi non sporcano i giorni puliti.
+- Non fa chiamate REST (usa solo il WebSocket) e non campiona lo spread.
+- Gira a bassa priorità, con al massimo 6 connessioni WebSocket ogni 10 minuti.
+
+```bash
+kb shadow-report
+```
+
+Ogni voce dice `COVERED` (vista almeno una volta) o `not yet`. Dopo un giorno di solito sono tutte coperte, tranne forse "post-only reject", che richiede un book incrociato. Log:
+
+```bash
+journalctl -u krakbot-shadow --since today -o cat | grep -v '"level": "INFO"'
+```
+
+Se servisse fermarla, l'istanza principale e il gate non cambiano:
+
+```bash
+sudo systemctl disable --now krakbot-shadow
+```
+
 ### Al termine
 
 ```bash
@@ -220,7 +242,7 @@ kb backup /opt/krakbot/data/backups/manuale.db
 Aggiornamento (fuori dai 7 giorni, e mai con una tranche live aperta):
 
 ```bash
-sudo -u krakbot git -C /opt/krakbot pull --ff-only
+sudo GIT_SSH_COMMAND="ssh -i /root/.ssh/krakbot_deploy -o IdentitiesOnly=yes" git -c safe.directory=/opt/krakbot -C /opt/krakbot pull --ff-only && sudo chown -R krakbot:krakbot /opt/krakbot
 ```
 
 ```bash
@@ -228,7 +250,7 @@ sudo -u krakbot /opt/krakbot/.venv/bin/pip install /opt/krakbot
 ```
 
 ```bash
-sudo systemctl restart krakbot
+sudo systemctl restart krakbot krakbot-shadow
 ```
 
 Le migrazioni del DB si applicano da sole all'avvio. Il bot rifiuta di partire se una migrazione già applicata è stata modificata o se il DB è più nuovo del codice.

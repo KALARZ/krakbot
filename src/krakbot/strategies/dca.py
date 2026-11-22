@@ -29,6 +29,7 @@ __all__ = [
     "fee_for",
     "min_qty",
     "order_qty",
+    "periodic_window",
     "plan",
     "week_budget",
     "window_at",
@@ -47,6 +48,14 @@ def window_at(now_ms: int, *, weekday: int, hour_utc: int, window_hours: int) ->
     if start > now_ms:
         start -= 7 * DAY_MS
     return start, start + window_hours * HOUR_MS
+
+
+def periodic_window(now_ms: int, *, period_ms: int, window_ms: int) -> tuple[int, int]:
+    """Shadow calendar: windows [k*period, k*period + window) aligned to the UTC epoch (e.g. every hour)."""
+    if not 0 < window_ms <= period_ms:
+        raise ValueError("0 < window <= period required")
+    start = now_ms // period_ms * period_ms
+    return start, start + window_ms
 
 
 @dataclass(frozen=True)

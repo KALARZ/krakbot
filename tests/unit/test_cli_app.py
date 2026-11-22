@@ -1,5 +1,6 @@
 """CLI (status / halt / resume / resolve / gate / liquidity-derive) and an App start-step-close smoke test."""
 
+import asyncio
 import io
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +10,7 @@ import httpx
 import pytest
 import respx
 
-from krakbot.app import App, LiveGateError
+from krakbot.app import App, BootAborted, LiveGateError
 from krakbot.cli import EXIT_OK, EXIT_REFUSED, main
 from krakbot.config import load_settings
 from krakbot.domain import Mode, OrderRole, OrderStatus, OrderType, Side
@@ -287,7 +288,7 @@ async def test_heartbeat_marks_every_healthy_minute_and_watchdog_ignores_market_
         assert any("degraded" in x for x in sent)
         assert app.store.conn.execute("SELECT COUNT(*) FROM heartbeats").fetchone()[0] == minutes[2]
         await app.close(clean=True, reason="test")
-    assert sent[0] == "READY=1" and sent[-1] == "STOPPING=1"
+    assert sent[0].startswith("READY=1") and sent[-1] == "STOPPING=1"
 
 
 
@@ -335,3 +336,50 @@ async def test_live_gate_is_a_one_time_unlock(cfg_dir, monkeypatch):
         app._check_live_allowed()   # a restart after the unlock is not refused
         assert len(app.store.events.by_kind("LIVE_UNLOCKED")) == 1
         app.conn.close()
+
+
+@respx.mock
+async def test_startup_waits_for_kraken_instead_of_crashing(cfg_dir, monkeypatch):
+    calls = {"n": 0}
+    notes = []
+    monkeypatch.setattr("krakbot.app.sd_notify", lambda st: notes.append(st) or True)
+
+    def asset_pairs(request):
+        calls["n"] += 1
+        if calls["n"] <= 2:  # an error the REST client does not retry itself: the app-level boot loop must
+            return httpx.Response(200, json={"error": ["EGeneral:Unknown method"]})
+        v1 = request.url.params.get("assetVersion") == "1"
+        return httpx.Response(200, json={"error": [], "result": ASSET_PAIRS_V1 if v1 else ASSET_PAIRS})
+
+    respx.get("https://api.kraken.com/0/public/AssetPairs").mock(side_effect=asset_pairs)
+    respx.get("https://api.kraken.com/0/public/Ticker").mock(
+        return_value=httpx.Response(200, json={"error": [], "result": TICKER}))
+    settings = load_settings(cfg_dir / "config.toml", cfg_dir / ".env")
+    async with httpx.AsyncClient() as http:
+        app = App(settings, live=False, http=http, alerts=MemoryAlerts(lambda: 0))
+        app.boot_backoff_s = (0.01, 0.02)
+        await app.start(asyncio.Event())
+        assert app.engine is not None and app.boot_failures >= 1
+        assert any("waiting for Kraken" in n for n in notes) and notes[-1].startswith("READY=1\nSTATUS=running")
+        assert app.store.conn.execute("SELECT COUNT(*) FROM heartbeats").fetchone()[0] == 0
+        await app.close(clean=True, reason="test")
+
+
+@respx.mock
+async def test_stop_while_waiting_for_kraken_at_startup(cfg_dir):
+    respx.get("https://api.kraken.com/0/public/AssetPairs").mock(
+        return_value=httpx.Response(200, json={"error": ["EGeneral:Unknown method"]}))
+    settings = load_settings(cfg_dir / "config.toml", cfg_dir / ".env")
+    stop = asyncio.Event()
+    async with httpx.AsyncClient() as http:
+        app = App(settings, live=False, http=http, alerts=MemoryAlerts(lambda: 0))
+        app.boot_backoff_s = (0.05, 0.05)
+        asyncio.get_running_loop().call_later(0.2, stop.set)
+        with pytest.raises(BootAborted):
+            await app.start(stop)
+        await app.close(clean=True, reason="stopped during startup")
+    conn = connect(settings.db_path)
+    try:
+        assert conn.execute("SELECT clean_exit FROM runs").fetchone()[0] == 1
+    finally:
+        conn.close()
