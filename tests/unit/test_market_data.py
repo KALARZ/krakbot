@@ -86,3 +86,18 @@ def test_sampler_fixed_grid_only_fresh_ws_and_daily_rollup(tmp_path, clock):
         assert row["n"] == 1 and row["spread_p95"] == "5.5953"
     finally:
         conn.close()
+
+
+def test_quiet_pair_stays_fresh_while_the_ws_session_is_alive(clock):
+    md = MarketData({"XBT/EUR": INST}, depth_bps=25, now_ms=lambda: clock["t"])
+    md.on_book("BTC/EUR", _book())
+    for _ in range(6):  # 60 s without a single change on this book, but heartbeats keep arriving
+        clock["t"] += 10_000
+        md.on_ws_alive()
+        assert md.top("XBT/EUR", require_ws=True) is not None and not md.needs_rest_fallback("XBT/EUR")
+    clock["t"] += 10_001  # the session went silent: stale
+    assert md.top("XBT/EUR") is None and md.needs_rest_fallback("XBT/EUR")
+    md.on_ws_alive()
+    md.on_book("BTC/EUR", None)  # checksum failure / disconnect: invalid even if the session is alive
+    md.on_ws_alive()
+    assert md.top("XBT/EUR") is None

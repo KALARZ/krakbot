@@ -38,9 +38,9 @@ def test_wal_fk_synchronous(db):
 def test_migrations_idempotent_and_recorded(tmp_path):
     conn = connect(tmp_path / "x.db")
     try:
-        assert migrate(conn) == [1, 2]
+        assert migrate(conn) == [1, 2, 3]
         assert migrate(conn) == []
-        assert [r[0] for r in conn.execute("SELECT version FROM schema_migrations")] == [1, 2]
+        assert [r[0] for r in conn.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
     finally:
         conn.close()
 

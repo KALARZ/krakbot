@@ -11,6 +11,8 @@ needs a hand-edited database.
   krakbot spreads [--days N]              per-pair daily spread / depth percentiles recorded in DRY_RUN
   krakbot liquidity-derive [--yes]        derive liquidity thresholds from the last N complete UTC days
   krakbot gate                            7-clean-days DRY_RUN gate for live DCA
+  krakbot canary-verify TRANCHE_ID [--yes] verify a closed LIVE canary tranche (fill, ledger, recon, balance)
+  krakbot backup PATH                     consistent online copy of the database (safe while the bot runs)
 """
 
 from __future__ import annotations
@@ -20,9 +22,11 @@ import asyncio
 import contextlib
 import json
 import signal
+import sqlite3
 import sys
 import time
 from collections.abc import Callable, Sequence
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import TextIO
 
@@ -31,6 +35,7 @@ import httpx
 from krakbot.app import DCA_PAIR, DRY_RUN_MAKER_FEE, App, LiveGateError
 from krakbot.config import ConfigError, Settings, load_settings
 from krakbot.domain import EventLevel, Mode
+from krakbot.execution.canary_verify import CanaryNotVerifiable, verify_canary
 from krakbot.execution.live import KrakenBroker
 from krakbot.execution.paper import PaperBroker
 from krakbot.execution.resolve import UNRESOLVED, ResolveAction, resolve_order, unresolved_for
@@ -42,10 +47,11 @@ from krakbot.market_data import MarketData
 from krakbot.monitor.alerts import Alerts, NullAlerts, TelegramAlerts
 from krakbot.monitor.logs import configure_logging
 from krakbot.state import connect, migrate
+from krakbot.state.canary import CANARY_CLEAN_TRANCHES, CanaryRepo
 from krakbot.state.dca import DcaRepo
 from krakbot.state.gates import DAY_MS, dca_live_gate
 from krakbot.state.liquidity import LiquidityRepo
-from krakbot.state.repo import NotFound, Store
+from krakbot.state.repo import NotFound, StateError, Store
 
 __all__ = ["main"]
 
@@ -79,6 +85,10 @@ def _active_run_id(store: Store, now_ms: int) -> str | None:
         "GROUP BY r.run_id HAVING MAX(h.minute) >= ? ORDER BY r.started_at DESC LIMIT 1",
         (now_ms // 60_000 - 3,)).fetchone()
     return None if r is None else str(r[0])
+
+
+def _utc(ms: int | None) -> str:
+    return "-" if ms is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000))
 
 
 def _mode_arg(ctx: _Ctx) -> Mode:
@@ -151,6 +161,10 @@ def cmd_status(ctx: _Ctx) -> int:
         if t is not None:
             ctx.p(f"  latest tranche #{t.seq} {t.tranche_id} status={t.status} budget={t.budget} spent={t.spent} "
                   f"carry_out={t.carry_out}")
+        if mode == Mode.LIVE:
+            c = CanaryRepo(store)
+            ctx.p(f"  canary: clean streak {c.streak()}/{CANARY_CLEAN_TRANCHES}, "
+                  f"phase {'complete (full size)' if c.phase_complete() else 'ACTIVE (minimum size)'}")
         for o in unresolved:
             ctx.p(f"  UNRESOLVED order {o.cl_ord_id} status={o.status} price={o.price} qty={o.qty} "
                   f"error={o.last_error!r} -> `krakbot resolve {o.cl_ord_id} --dry`")
@@ -158,7 +172,8 @@ def cmd_status(ctx: _Ctx) -> int:
                            "LIMIT 1").fetchone()
     if r is not None:
         hb = store.conn.execute("SELECT MAX(minute) FROM heartbeats WHERE run_id = ?", (r[0],)).fetchone()[0]
-        ctx.p(f"last run {r[0][:8]} started={r[1]} ended={r[2]} clean={r[3]} last_heartbeat_minute={hb}")
+        ctx.p(f"last run {r[0][:8]} started={_utc(r[1])} ended={_utc(r[2])} clean={r[3]} "
+              f"last_healthy_minute={_utc(hb * 60_000 if hb is not None else None)}")
     store.conn.close()
     return EXIT_OK
 
@@ -184,6 +199,9 @@ def cmd_resume(ctx: _Ctx) -> int:
         if rs.halt_reason == "unknown_order" or unresolved_for(store, "dca", mode):
             ctx.p(f"REFUSED: dca {mode} has an ambiguous order ({rs.halt_ref}). Use `krakbot resolve <cl_ord_id>`; "
                   "resume never clears an unknown-order halt.")
+            return EXIT_REFUSED
+        if rs.halt_reason == "canary":
+            ctx.p(f"REFUSED: canary halt on {rs.halt_ref}: only `krakbot canary-verify {rs.halt_ref} --yes` clears it.")
             return EXIT_REFUSED
         if rs.halt_reason not in ("manual", "recon"):
             ctx.p(f"REFUSED: halt reason {rs.halt_reason!r} is not resumable from here.")
@@ -271,6 +289,65 @@ def cmd_resolve(ctx: _Ctx) -> int:
     return asyncio.run(_resolve(ctx))
 
 
+# ---------------------------------------------------------------------------------------------------------- canary
+async def _canary_verify(ctx: _Ctx) -> int:
+    a = ctx.args
+    sec = ctx.settings.secrets
+    store = ctx.store()
+    try:
+        try:
+            DcaRepo(store).get(a.tranche_id)
+        except StateError:
+            ctx.p(f"no tranche {a.tranche_id}")
+            return EXIT_ERROR
+        if not sec.has_kraken_keys:
+            ctx.p("REFUSED: canary verification queries Kraken: the API key (query permissions) is needed in .env.")
+            return EXIT_REFUSED
+        cfg = ctx.settings.app.strategies.dca
+        total = (sec.CAPITAL * cfg.allocation).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as http:
+            public = KrakenRestClient(http=http)
+            inst = (await public.asset_pairs())[cfg.pair]
+            private = KrakenRestClient(http=http, api_key=sec.KRAKEN_API_KEY, api_secret=sec.KRAKEN_API_SECRET,
+                                       nonce=NonceSource(SqliteNonceStore(store.conn)), trading_enabled=False)
+            try:
+                chk = await verify_canary(store, private, a.tranche_id, base_asset=inst.base, total_budget=total)
+            except CanaryNotVerifiable as exc:
+                ctx.p(f"REFUSED: {exc}")
+                return EXIT_REFUSED
+        for name, ok in (("fill", chk.fill_ok), ("ledger", chk.ledger_ok), ("reconciliation", chk.recon_ok),
+                         ("balance", chk.balance_ok)):
+            ctx.p(f"  {name:<15} {'OK' if ok else 'FAILED'}")
+        ctx.p(json.dumps(chk.details, indent=2, default=str))
+        canary = CanaryRepo(store)
+        if not chk.ok:
+            canary.record(a.tranche_id, chk)  # a definitive mismatch is recorded: this tranche can never be clean
+            ctx.p("REFUSED: canary check failed; the halt stays. Investigate before anything else.")
+            return EXIT_REFUSED
+        if not a.yes:
+            ctx.p("All checks passed. Look at the order and the balance on kraken.com, then re-run with --yes.")
+            return EXIT_REFUSED
+        canary.record(a.tranche_id, chk)
+        cleared = store.risk.clear_halt("dca", Mode.LIVE, reason="canary", ref=a.tranche_id)
+        streak = canary.streak()
+        ctx.p(f"verified; halt cleared: {cleared}; clean canary streak {streak}/{CANARY_CLEAN_TRANCHES}; "
+              + ("canary phase COMPLETE: next tranche at full size." if canary.phase_complete()
+                 else "next tranche stays at the minimum size."))
+        if canary.phase_complete():
+            store.events.append("CANARY_COMPLETE", EventLevel.WARNING, {"streak": streak}, strategy="dca",
+                                mode=Mode.LIVE)
+        return EXIT_OK
+    except KrakenError as exc:
+        ctx.p(f"REFUSED: Kraken query failed ({exc}); nothing recorded, the halt stays.")
+        return EXIT_REFUSED
+    finally:
+        store.conn.close()
+
+
+def cmd_canary_verify(ctx: _Ctx) -> int:
+    return asyncio.run(_canary_verify(ctx))
+
+
 # ---------------------------------------------------------------------------------------------------------- liquidity
 def cmd_spreads(ctx: _Ctx) -> int:
     store = ctx.store()
@@ -294,9 +371,10 @@ def cmd_liquidity_derive(ctx: _Ctx) -> int:
         end = (ctx.now() // DAY_MS) * DAY_MS  # last complete UTC day boundary
         start = end - rules.reference_days * DAY_MS
         set_id = f"liq-{time.strftime('%Y%m%d', time.gmtime(start / 1000))}-{rules.reference_days}d"
-        lg = s.app.live_gate
-        g = dca_live_gate(store.conn, ctx.now(), days=rules.reference_days, min_coverage=lg.min_heartbeat_coverage,
+        g = dca_live_gate(store.conn, ctx.now(), pairs=list(rules.sample_pairs),
                           current_run_id=_active_run_id(store, ctx.now()))
+        if g.window != (start, end):
+            raise ValueError(f"gate window {g.window} != reference window {(start, end)}")
         if not g.allowed:  # plan §6: thresholds come from CLEAN DRY_RUN days only
             ctx.p("REFUSED: the reference days are not all clean DRY_RUN days:")
             for reason in g.reasons[:20]:
@@ -322,12 +400,41 @@ def cmd_liquidity_derive(ctx: _Ctx) -> int:
 
 def cmd_gate(ctx: _Ctx) -> int:
     store = ctx.store()
-    lg = ctx.settings.app.live_gate
-    g = dca_live_gate(store.conn, ctx.now(), days=lg.dry_run_clean_days, min_coverage=lg.min_heartbeat_coverage,
-                      current_run_id=_active_run_id(store, ctx.now()))
+    pairs = list(ctx.settings.app.liquidity.sample_pairs)
+    g = dca_live_gate(store.conn, ctx.now(), pairs=pairs, current_run_id=_active_run_id(store, ctx.now()))
+    ctx.p("day         uptime  halted  min_samples(pair)          recon  unclean  clean")
+    for d in g.days:
+        worst = min(d.sample_coverage.items(), key=lambda kv: kv[1])
+        ctx.p(f"{time.strftime('%Y-%m-%d', time.gmtime(d.day_start_ms / 1000))}  {d.coverage:.4f}  "
+              f"{'yes' if d.halted else 'no':<6}  {worst[1]:.4f} ({worst[0]:<9})  {d.recon_checks - d.recon_failures}/"
+              f"{d.recon_checks:<4} {d.unclean_runs:<7}  {'CLEAN' if d.clean() else 'no'}")
     ctx.p(json.dumps({"allowed": g.allowed, "reasons": g.reasons}, indent=2))
     store.conn.close()
     return EXIT_OK if g.allowed else EXIT_REFUSED
+
+
+def cmd_backup(ctx: _Ctx) -> int:
+    dest = Path(ctx.args.path)
+    if dest.exists():
+        ctx.p(f"REFUSED: {dest} exists (never overwritten)")
+        return EXIT_REFUSED
+    src = sqlite3.connect(ctx.settings.db_path)
+    try:
+        out = sqlite3.connect(dest)
+        try:
+            src.backup(out)  # SQLite online backup API: a consistent snapshot even with the bot writing (WAL)
+        finally:
+            out.close()
+        dest.chmod(0o600)
+        chk = sqlite3.connect(dest)
+        try:
+            ok = chk.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            chk.close()
+    finally:
+        src.close()
+    ctx.p(f"backup written to {dest} (integrity_check: {ok})")
+    return EXIT_OK if ok == "ok" else EXIT_ERROR
 
 
 def cmd_flatten(ctx: _Ctx) -> int:
@@ -376,6 +483,13 @@ def build_parser() -> argparse.ArgumentParser:
     ld.add_argument("--yes", action="store_true")
     ld.set_defaults(fn=cmd_liquidity_derive)
     sub.add_parser("gate").set_defaults(fn=cmd_gate)
+    cv = sub.add_parser("canary-verify")
+    cv.add_argument("tranche_id")
+    cv.add_argument("--yes", action="store_true")
+    cv.set_defaults(fn=cmd_canary_verify)
+    bk = sub.add_parser("backup")
+    bk.add_argument("path")
+    bk.set_defaults(fn=cmd_backup)
     sub.add_parser("flatten").set_defaults(fn=cmd_flatten)
     sub.add_parser("backtest").set_defaults(fn=cmd_backtest)
     return ap

@@ -279,3 +279,18 @@ def test_freeze_hash_includes_liquidity_thresholds_and_version(cfg_dir):
     assert a != b and a == c  # order-insensitive, value-sensitive
     assert forward_test_freeze_hash(app) != forward_test_freeze_hash(app, strategy_version="donchian-2")
     assert forward_test_freeze_hash(app) == forward_test_freeze_hash(_load(cfg_dir).app)  # stable across loads
+
+
+@pytest.mark.parametrize("old,new", [
+    ('dry_run_clean_days = 7 ', 'dry_run_clean_days = 8 '),
+    ('min_heartbeat_coverage = "0.99"', 'min_heartbeat_coverage = "0.95"'),
+    ('min_sample_coverage = "0.90"      # per sample pair', 'min_sample_coverage = "0.80"      # per sample pair'),
+])
+def test_clean_day_rule_is_pre_registered(cfg_dir, old, new):
+    _patch(cfg_dir, old, new)
+    assert "pre-registered" in _problems(cfg_dir)
+
+
+def test_sampling_grid_is_pre_registered(cfg_dir):
+    _patch(cfg_dir, "sample_seconds = 10 ", "sample_seconds = 5 ")
+    assert "pre-registered (clean-day rule)" in _problems(cfg_dir)

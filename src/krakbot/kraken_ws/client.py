@@ -32,6 +32,7 @@ log = logging.getLogger("krakbot.kraken_ws")
 BookCb = Callable[[str, OrderBook | None], None]
 TradeCb = Callable[[str, list[dict[str, Any]]], None]
 StatusCb = Callable[[dict[str, Any]], None]
+AliveCb = Callable[[], None]
 Connect = Callable[[str], Awaitable[Any]]
 
 
@@ -39,11 +40,13 @@ class PublicWs:
     def __init__(self, symbols: Sequence[str], *, on_book: BookCb, on_trade: TradeCb | None = None,
                  on_status: StatusCb | None = None, url: str = WS_URL, depth: int = 100,
                  heartbeat_timeout_s: float = 5.0, max_backoff_s: float = 60.0, connect: Connect | None = None,
-                 clock: Clock | None = None, rng: random.Random | None = None) -> None:
+                 clock: Clock | None = None, rng: random.Random | None = None,
+                 on_alive: AliveCb | None = None) -> None:
         if depth not in (10, 25, 100, 500, 1000):
             raise ValueError("Kraken book depth must be one of 10, 25, 100, 500, 1000")
         self.symbols = list(symbols)
         self._on_book, self._on_trade, self._on_status = on_book, on_trade, on_status
+        self._on_alive = on_alive  # every message (heartbeats included) proves the session and its books are live
         self._url, self._depth = url, depth
         self._hb, self._max_backoff = heartbeat_timeout_s, max_backoff_s
         self._connect = connect or _default_connect
@@ -100,6 +103,8 @@ class PublicWs:
                 raise ConnectionError(f"no message for {self._hb}s (heartbeat deadline)") from exc
             msg = json.loads(raw, parse_float=Decimal)
             await self._handle(ws, msg)
+            if self._on_alive is not None:
+                self._on_alive()
 
     async def _handle(self, ws: Any, msg: dict[str, Any]) -> None:
         ch = msg.get("channel")

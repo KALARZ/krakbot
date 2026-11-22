@@ -310,12 +310,60 @@ Implementazione (blocco 4, `src/krakbot/cli.py`): per un ordine LIVE servono le 
 **Schema** (migrazione 0002, blocco 3): `risk_state.halt_reason` accetta anche `unknown_order` e `recon`; `orders.status = unknown` esiste già.
 **Test** (blocco 4 per il DCA, poi Donchian): timeout dopo l'invio con ordine poi trovato aperto, poi trovato fillato, poi assente provato; REST giù per oltre 2 minuti, quindi halt persistente che **non** si sblocca da solo nemmeno quando l'evidenza torna disponibile, e `resolve` che rifiuta di sbloccare senza evidenza; ordine dubbio di vendita e ri-protezione senza doppia vendita. Stato: la parte DCA è coperta in `tests/unit/test_dca_engine.py`, `test_cli_app.py`, `test_live_broker_dms.py`; la vendita dubbia e la ri-protezione arrivano col Donchian (blocco 6).
 
-## 5. Dead man's switch: deviazione motivata dal requisito
+## 5. Dead man's switch e passaggio al live (deviazione motivata, regole pre-registrate)
 Requisito: `CancelAllOrdersAfter` a 60 s rinnovato a ogni ciclo. Fatto verificato: allo scadere cancella **tutti** gli ordini, **stop compresi**. Applicato alla lettera, ogni crash o partizione di rete oltre 60 s lascia le posizioni nude: il contrario di "crash-safe".
 - **Default `DMS_MODE=entry_only`**: timer armato (timeout 60 s, refresh ogni 20 s) solo mentre ci sono ordini di ingresso aperti **e** nessuno stop a riposo. Disarmato (`timeout=0`) appena esiste uno stop, e prima delle manutenzioni annunciate sul canale `status`. Gli ingressi sono comunque GTD più `deadline`, quindi non sopravvivono al bot.
 - `DMS_MODE=always` resta disponibile, così com'era richiesto, con warning all'avvio e nel README: "un crash con posizione aperta la lascia senza stop dopo 60 s".
 - Il "dead man's switch" del monitor è un'altra cosa: heartbeat esterno (§7).
 - Test (§8): mock che verifica arm/refresh/disarm per stato, più un test di crash simulato in entrambe le modalità.
+
+### 5.1 Giorno pulito (pre-registrato il 2026-11-22, prima dell'avvio dei 7 giorni)
+Un giorno UTC di DRY_RUN è **pulito** solo se valgono tutte le condizioni. Valori in `state/gates.py::CLEAN_DAY_RULE`; `config.toml` `[live_gate]` accetta solo questi, cambiarli è una modifica di codice.
+
+| # | Condizione | Misura |
+|---|---|---|
+| 1 | **Uptime ≥ 99%** | minuti UTC con heartbeat / 1440. L'heartbeat si scrive al massimo una volta per minuto, **allineato al minuto**, solo se il loop è sano: book WS fresco e valido su XBT/EUR. Tolleranza: 14 minuti al giorno |
+| 2 | **Nessun halt** | il DCA DRY_RUN non è mai stato in halt durante il giorno, per nessun motivo: ricostruito dagli eventi `HALT`/`HALT_CLEARED`. Basta un halt di un minuto, anche poi tolto; vale anche un halt rimasto attivo dal giorno prima |
+| 3 | **≥ 90% dei campioni attesi, per ogni coppia** | campioni di book (griglia fissa a 10 s, solo da WS fresco) / 8640, per **ognuna** delle 8 coppie di `sample_pairs` |
+| 4 | **Nessun controllo di coerenza fallito** | almeno una riconciliazione DCA nel giorno (all'avvio e ogni ora) e nessuna fallita |
+| 5 | Nessuna uscita sporca | nessun crash, kill, riavvio da watchdog o run mai chiusa che si sovrapponga al giorno |
+| 6 | Modalità | ogni run del giorno con il DCA in `dry_run` |
+
+Sulla finestra intera serve inoltre almeno un ordine DCA DRY_RUN arrivato a stato terminale (il percorso ordine → fill/scadenza → registro è stato esercitato). Finestra: gli ultimi 7 giorni UTC **completi**. `krakbot gate` mostra la tabella giorno per giorno.
+
+**Sblocco una tantum.** Il gate sblocca il LIVE una sola volta: al primo avvio LIVE riuscito registra l'evento `LIVE_UNLOCKED`, con la finestra verificata. I riavvii LIVE successivi (crash, deploy) non lo ricontrollano: la finestra conterrebbe ormai run LIVE e rifiuterebbe per sempre. Restano sempre obbligatori config `live`, interlock `.env` e chiavi.
+
+**Soglie di liquidità solo da giorni puliti**: `krakbot liquidity-derive` usa esattamente la stessa finestra del gate e rifiuta se anche un solo giorno non è pulito. Le soglie derivate sostituiscono quelle del campione di 30 minuti.
+
+Difetti corretti durante la pre-registrazione, che avrebbero falsato le misure:
+- l'heartbeat "≥ 60 s dall'ultimo" su un loop da circa 1 s saltava circa un minuto ogni 60, cioè un uptime misurato del 98,4% anche con il bot sempre sano: nessun giorno sarebbe mai stato pulito;
+- un book valido ma fermo (coppia tranquilla) risultava stantio dopo 10 s, perdeva campioni e sbilanciava il campione verso i momenti attivi. Ora resta fresco finché la sessione WS è viva (qualunque messaggio, heartbeat incluso); disconnessione e checksum errato lo invalidano subito.
+
+### 5.2 DMS nel DCA live (comportamento confermato)
+- Modalità `entry_only`: il DCA non ha stop, quindi il timer è **armato ogni volta che un ordine può stare a riposo sul book**: ordine aperto o parzialmente eseguito, in volo (`sent`) o dubbio (`unknown`). Timeout 60 s, refresh ogni 20 s.
+- Si arma **prima** dell'invio. Se Kraken non conferma l'armamento, **l'ordine non parte** (`WaitReason.DMS_UNAVAILABLE`, allarme).
+- Disarmato (`timeout=0`) quando non resta nulla che possa riposare, e all'avvio (§4.6).
+- Effetto: se il bot muore, crasha o perde la rete, Kraken **cancella il buy GTD a riposo entro 60 s**; il GTD lo farebbe comunque entro 300 s. Anche a uno stop pulito (deploy) il timer resta armato e cancella l'ordine entro 60 s. Al riavvio la tranche riprende col budget residuo ricostruito dai fill.
+- Per le doc Kraken il timer cancella "*all* client orders". Non è specificato se per chiave API o per account, quindi va trattato come per account: **non lasciare ordini manuali su questo account mentre il DCA live gira**. Le doc raccomandano anche di disarmarlo prima delle manutenzioni: alla ripresa del motore cancellerebbe tutto. Per il DCA è innocuo, perché ripiazza.
+- La fee si paga esplicitamente in EUR (`oflags=post,fciq`), come assume il registro (`fciq` è già il default per gli acquisti; ora è esplicito).
+
+### 5.3 Canary del live (pre-registrato; nessun ordine reale prima del tuo OK)
+1. **Prima tranche alla size minima assoluta.** Finché non ci sono 3 tranche canary pulite consecutive, ogni tranche LIVE è una canary: **un solo ordine** di `min_qty = max(ordermin, costmin / prezzo arrotondato per eccesso al lotto)`, oggi 0,00006 BTC (circa 3,3 EUR). Budget = quanto basta per quell'ordine fino al limite di inseguimento, fee inclusa, arrotondato al centesimo (circa 3,42 EUR). Il resto del dovuto resta nel registro.
+2. **Sorvegliata, halt pronto.** All'apertura arriva un allarme con il comando `krakbot halt --mode live --reason ...` già pronto.
+3. **Si prosegue solo dopo la verifica.** Alla chiusura della tranche canary il DCA va in halt (`canary`). Non nasce nessuna tranche nuova finché `krakbot canary-verify <tranche> --yes` non passa i 4 controlli contro Kraken:
+   - **fill**: ordini terminali su Kraken con `vol_exec` = quantità nel DB; ogni fill uguale al trade Kraken (prezzo, quantità, fee, ordine);
+   - **registro**: speso, quantità e fee della tranche = somma dei fill;
+   - **riconciliazione**: quella completa del DCA LIVE passa;
+   - **saldo**: saldo BTC su Kraken − baseline = BTC comprati in LIVE, uguaglianza esatta. La baseline si registra al primo avvio LIVE, una volta sola: durante la canary **nessun altro movimento di BTC** sull'account.
+
+   Senza `--yes` mostra l'esito senza registrarlo: prima guardi l'ordine e il saldo su kraken.com. Un controllo fallito si registra e l'halt resta. Kraken irraggiungibile ⇒ non si registra nulla e l'halt resta. `resume` non toglie mai un halt `canary`.
+4. **Nessun aumento di size prima di 3 tranche pulite consecutive.** Pulita = `filled` con quantità > 0, almeno una verifica passata e nessuna fallita. Una tranche canary non eseguita, parziale o con un controllo fallito **azzera** la serie. Dopo la terza pulita consecutiva la tranche successiva va a size piena (con il recupero del dovuto entro il tetto 2×); evento `CANARY_COMPLETE`.
+
+### 5.4 Run ombra a orologio compresso: non esiste
+Il bot **non** ha una modalità a orologio compresso. Il tempo accelerato esiste solo nei test (`tests/unit/dca_harness.py`, orologio manuale), dove repricing, scadenza GTD, parziali, riporto e i casi dubbi sono già coperti. Durante i 7 giorni la DRY_RUN vera vedrà una sola finestra (lunedì 10:00 UTC, 24 h): repricing e scadenza GTD sì, il riporto solo se la tranche non si riempie. Proposta separata, non implementata (§10): una seconda istanza DRY_RUN con calendario compresso (finestre orarie) su un DB separato, che non tocchi il gate.
+
+### 5.5 Ordine dei blocchi
+Il blocco 6 (Donchian) parte **solo dopo che il DCA live è stabile**: canary completata (3 tranche pulite consecutive) e poi almeno una tranche a size piena senza halt né riconciliazioni fallite.
 
 ## 6. Rischio (soglie numeriche e comportamento)
 - **Sizing**: `qty = floor_lot( equity_MTM × risk_pct × size_mult / (entry − stop) )`. Con `risk_pct` = 0.5% (range ammesso 0.25–1%), cap 15% dell'equity per posizione e 30% totale, massimo 3 posizioni, una per coppia, niente piramidi né medie. Se `qty×price < max(ordermin×price, costmin) × 1.5` il trade si salta, con log del motivo.
@@ -385,8 +433,9 @@ Ordine di scrittura (aggiornato): config e schema (1), kraken_rest (2), state (3
 | 2 | `kraken_rest`: firma HMAC verificata sul test vector ufficiale; nonce in ms persistito prima dell'invio, mai decrescente; richieste private serializzate; limiter REST/engine/pubblico allo 0.8 della soglia del tier Starter; classificazione errori; retry solo se l'ordine certamente non è stato eseguito o la chiamata è idempotente, altrimenti `OutcomeUnknownError`; trading bloccato prima di ogni I/O se non abilitato; validazione locale di tick/lot/ordermin/costmin | ✅ | `pytest`: 148 passati (Kraken mockato con respx); `ruff` e `mypy --strict` puliti. Smoke test **in sola lettura** sulle API pubbliche reali (Time, SystemStatus, AssetPairs, Ticker): parsing corretto. Bug trovato e corretto: loop infinito del limiter su residui float, con test di regressione. Nessuna API key usata |
 | 3 | `state`: repository (`repo.py`, `liquidity.py`, `dca.py`, `forward.py`) e migrazione 0002. Macchina a stati persistita con optimistic locking ed eventi nella stessa transazione. Ordini in write-ahead (`intent` prima dell'invio, `unknown` lasciabile solo con evidenza). Fill idempotenti su `exec_id`; `filled_qty` ricalcolato sempre dai fill; overfill rifiutato; un fill su ordine `rejected` fa escalation. Halt per strategia, rimossi solo se il motivo coincide. Percentili nearest-rank e derivazione delle soglie per coppia con copertura minima. Tranche DCA che non possono superare il budget (regola rivista nel blocco 4: il fill reale si registra sempre, vedi §0.1). Registro dei forward test (uno solo in corso; hash cambiato ⇒ chiusura) | ✅ | `pytest`: 267 passati, tra cui la migrazione 0001→0002 su DB con dati e la ricostruzione di `risk_state` senza perdite; `ruff` e `mypy --strict` puliti |
 | 4 | **Verticale DCA** (anticipata: è l'unica parte che toccherà soldi e l'unica con aspettativa positiva). `kraken_ws` (book v2 con checksum CRC32, trade, heartbeat, riconnessione con backoff); `market_data` (top of book da WS, fallback REST, freschezza 10 s) e campionatore a griglia fissa di 10 s (solo da WS fresco) con percentili giornalieri; strategia DCA pura (§0.1); broker DRY_RUN (fill maker solo su trade **strettamente sotto** il prezzo, rifiuto post-only, scadenza GTD) e broker LIVE (AddOrder post-only GTD con `deadline`, lookup per `cl_ord_id`); motore DCA con halt su ordine dubbio e risoluzione solo su evidenza (§4.7); DMS `entry_only`; riconciliazione oraria; `monitor` (log JSON con redazione, Telegram con dedup, heartbeat DB/systemd/ping esterno); `app` (composizione e loop) e `cli` con `resolve` | ✅ | `pytest`: 347 passati; `ruff` (src e test) e `mypy --strict` puliti. Smoke test reale in DRY_RUN, **solo dati pubblici, nessuna chiave**: AssetPairs/Ticker/WS v2 reali, 7 campioni per ciascuna delle 8 coppie in 70 s, heartbeat, riconciliazione ok, uscita pulita su SIGINT. Difetti trovati e corretti: client REST senza URL assoluto (in produzione ogni chiamata sarebbe fallita); fee arrotondata per eccesso che faceva rifiutare un fill reale (`OverBudget`); lookup su `ClosedOrders` esposto alla paginazione da 50; campo `level` dei log sovrascrivibile da un `extra`; refresh di AssetPairs ogni 24 h mancante |
-| 5 | Accettazione DCA: 7 giorni di DRY_RUN puliti sul VPS e soglie di liquidità derivate; poi smoke test live a size minima e DCA LIVE (con tuo OK) | — | — |
-| 6 | Donchian (solo DRY_RUN): `features`, `signals`, `risk` (sizing dallo stop, breaker, kill), OCO emulato, DMS `entry_only`, recovery §4.5–4.6 su stop simulati, `portfolio` paper a tier 1 | — | — |
+| 5a | Preparazione dell'accettazione: giorno pulito pre-registrato (§5.1) nel gate e nel validatore; DMS live armato prima di ogni invio, anche con ordini in volo o dubbi (§5.2); canary pre-registrata (§5.3: migrazione 0003, `canary-verify`, baseline del saldo); `fciq` esplicito; watchdog systemd sul loop vivo (non sulla salute del mercato); heartbeat allineato al minuto; freschezza del book legata alla sessione WS; `krakbot backup`; unità systemd DRY_RUN e LIVE (mutuamente esclusive); README VPS; `docs/runbook.md` | ✅ | `pytest`: 378 passati; `ruff` e `mypy --strict` puliti; `systemd-analyze verify` pulito, salvo il binario non installato nel container. Comandi del runbook provati su un DB reale migrato 0002 → 0003. Installazione da venv pulito ok. Smoke reale di 130 s in DRY_RUN (solo dati pubblici) con socket systemd simulato: READY, WATCHDOG ogni 10 s con STATUS, STOPPING; heartbeat su 3 minuti consecutivi senza buchi; 13 campioni per ciascuna delle 8 coppie; uscita pulita |
+| 5 | Accettazione DCA: 7 giorni UTC puliti consecutivi sul VPS (§5.1), poi `liquidity-derive`; poi canary LIVE (§5.3) **con tuo OK esplicito** | in attesa del VPS | — |
+| 6 | Parte solo con il DCA live stabile (§5.5). Donchian (solo DRY_RUN): `features`, `signals`, `risk` (sizing dallo stop, breaker, kill), OCO emulato, DMS `entry_only`, recovery §4.5–4.6 su stop simulati, `portfolio` paper a tier 1 | — | — |
 | 7 | Avvio del forward test: ricalcolo del baseline con gli spread misurati, congelamento (hash e soglie), poi via. Checkpoint a 100 trade | — | — |
 | 8 | Deploy (Dockerfile, compose, systemd), README VPS, runbook, `docs/strategy.md`. Le parti necessarie al DCA arrivano già nel blocco 4/5 | — | — |
 

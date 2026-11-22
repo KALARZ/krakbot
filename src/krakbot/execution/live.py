@@ -54,7 +54,8 @@ class KrakenBroker:
     async def place_post_only_buy(self, req: PlaceRequest) -> OrderUpdate:
         inst = self._inst[req.pair]
         add = AddOrderRequest(pair=inst.altname, side=Side.BUY, ordertype=OrderType.LIMIT, volume=req.qty,
-                              price=req.price, cl_ord_id=req.cl_ord_id, post_only=True, timeinforce="GTD",
+                              price=req.price, cl_ord_id=req.cl_ord_id, post_only=True, fee_in_quote=True,
+                              timeinforce="GTD",
                               expire_after_s=req.expire_after_s, deadline_s=req.deadline_s)
         try:
             r = await self._rest.add_order(add, inst)

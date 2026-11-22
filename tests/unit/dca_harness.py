@@ -89,7 +89,8 @@ class Harness:
 
 
 def make(tmp_path: Path, *, start_ms: int = MONDAY_10 + 30_000, capital: str = "5000",
-         config_patch: tuple[str, str] | None = None) -> Harness:
+         config_patch: tuple[str, str] | None = None, mode: Mode = Mode.DRY_RUN, dms: object | None = None,
+         env_extra: str = "") -> Harness:
     root = Path(__file__).resolve().parents[2]
     cfg = (root / "config.toml").read_text()
     if config_patch is not None:
@@ -97,7 +98,7 @@ def make(tmp_path: Path, *, start_ms: int = MONDAY_10 + 30_000, capital: str = "
         cfg = cfg.replace(config_patch[0], config_patch[1], 1)
     (tmp_path / "config.toml").write_text(cfg)
     env = tmp_path / ".env"
-    env.write_text(f"CAPITAL={capital}\n")
+    env.write_text(f"CAPITAL={capital}\n{env_extra}")
     env.chmod(0o600)
     settings = load_settings(tmp_path / "config.toml", env)
     clock = Clock(start_ms)
@@ -113,7 +114,39 @@ def make(tmp_path: Path, *, start_ms: int = MONDAY_10 + 30_000, capital: str = "
     p = plan(capital=settings.secrets.CAPITAL, allocation=cfgd.allocation, tranches=cfgd.tranches,
              min_cost=INST.min_cost(Decimal("55582.35")), safety=cfgd.min_tranche_safety_factor)
     engine = DcaEngine(settings=settings, store=store, dca=dca, liq=liq, md=md, broker=broker, inst=INST,
-                       mode=Mode.DRY_RUN, plan=p, fee_rate=lambda: Decimal("0.004"), alerts=alerts, now_ms=clock)
+                       mode=mode, plan=p, fee_rate=lambda: Decimal("0.004"), alerts=alerts, now_ms=clock,
+                       dms=dms)  # type: ignore[arg-type]
     h = Harness(settings, clock, store, dca, liq, md, broker, alerts, engine, p)
     h.book()
     return h
+
+
+class FakeDms:
+    """Stands in for DmsController: records arm/disarm decisions; can be told the exchange refuses to arm."""
+
+    def __init__(self, log: list[str] | None = None, *, fail: bool = False) -> None:
+        self.log = log if log is not None else []
+        self.fail = fail
+        self.armed = False
+
+    async def maintain(self, *, entries_working: bool, stops_resting: bool) -> None:
+        want = entries_working and not stops_resting
+        if want and not self.armed and not self.fail:
+            self.armed = True
+            self.log.append("arm")
+        elif not want and self.armed:
+            self.armed = False
+            self.log.append("disarm")
+
+    async def disarm(self) -> None:
+        self.armed = False
+
+
+class RecordingPaper(PaperBroker):
+    def __init__(self, *a, log: list[str], **kw) -> None:
+        super().__init__(*a, **kw)
+        self.log = log
+
+    async def place_post_only_buy(self, req):
+        self.log.append("place")
+        return await super().place_post_only_buy(req)

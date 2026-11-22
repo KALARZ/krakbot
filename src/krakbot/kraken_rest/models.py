@@ -116,6 +116,7 @@ class AddOrderRequest:
     price: Decimal | None = None  # limit price, or trigger price for stop-loss
     trigger: Literal["last", "index"] | None = None
     post_only: bool = False
+    fee_in_quote: bool = False    # oflags fciq: fee charged in the quote currency (EUR)
     timeinforce: Literal["GTC", "GTD", "IOC"] = "GTC"
     expire_after_s: int | None = None
     deadline_s: int | None = None
@@ -181,8 +182,9 @@ class AddOrderRequest:
             params.append(("price", _s(self.price)))
         if self.trigger is not None:
             params.append(("trigger", self.trigger))
-        if self.post_only:
-            params.append(("oflags", "post"))
+        flags = [f for f, on in (("post", self.post_only), ("fciq", self.fee_in_quote)) if on]
+        if flags:
+            params.append(("oflags", ",".join(flags)))
         if self.timeinforce != "GTC":
             params.append(("timeinforce", self.timeinforce))
         if self.expire_after_s is not None:

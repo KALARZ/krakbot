@@ -1,0 +1,16 @@
+# Daily consistent copy of the SQLite database (online backup API: safe while the bot is running).
+[Unit]
+Description=krakbot - daily database backup
+
+[Service]
+Type=oneshot
+User=krakbot
+Group=krakbot
+WorkingDirectory=/opt/krakbot
+UMask=0077
+ExecStart=/bin/sh -c 'mkdir -p /opt/krakbot/data/backups && /opt/krakbot/.venv/bin/krakbot --config /opt/krakbot/config.toml --env /opt/krakbot/.env backup /opt/krakbot/data/backups/krakbot-$(date -u +%%Y%%m%%dT%%H%%M%%SZ).db && find /opt/krakbot/data/backups -name "krakbot-*.db" -mtime +30 -delete'
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/krakbot/data
+ProtectHome=yes
+PrivateTmp=yes

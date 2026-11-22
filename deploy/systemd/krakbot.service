@@ -1,0 +1,53 @@
+# krakbot DRY_RUN (paper broker, zero real orders): the 7-day acceptance run of plan §10 block 5.
+# Install: see README.md "VPS". Logs: journalctl -u krakbot -o cat (one JSON object per line).
+[Unit]
+Description=krakbot DCA - DRY_RUN (paper broker, no real orders)
+Documentation=file:///opt/krakbot/docs/runbook.md
+Wants=network-online.target
+After=network-online.target time-sync.target
+Conflicts=krakbot-live.service
+# at most 5 restarts in 15 minutes, then systemd gives up (the external heartbeat monitor alerts you)
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=krakbot
+Group=krakbot
+WorkingDirectory=/opt/krakbot
+ExecStart=/opt/krakbot/.venv/bin/krakbot --config /opt/krakbot/config.toml --env /opt/krakbot/.env dry-run
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=15
+# the main loop pings every 10 s while it is alive (healthy or not); 120 s of silence = hung -> SIGABRT + restart
+WatchdogSec=120
+TimeoutStartSec=120
+TimeoutStopSec=30
+KillSignal=SIGTERM
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+
+# hardening: the bot needs outbound HTTPS/WSS and its data directory, nothing else
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/krakbot/data
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

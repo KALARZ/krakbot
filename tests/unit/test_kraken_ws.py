@@ -123,12 +123,14 @@ async def test_snapshot_update_and_checksum_resubscribe():
         await ws.send('{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"sell","price":45280.1,"qty":0.5,"ord_type":"market","trade_id":1,"timestamp":"2026-11-22T10:00:00.000000Z"}]}')
         await asyncio.sleep(5)
 
-    books, trades = [], []
+    books, trades, alive = [], [], []
     async with FakeKraken(script) as srv:
         c = PublicWs(["BTC/USD"], url=srv.url, depth=10, on_book=lambda s, b: books.append(b is not None and b.valid),
-                     on_trade=lambda s, t: trades.extend(t), connect=websockets.connect, clock=ManualClock())
+                     on_trade=lambda s, t: trades.extend(t), connect=websockets.connect, clock=ManualClock(),
+                     on_alive=lambda: alive.append(1))
         await _run_until(c, lambda: len(trades) == 1)
     assert c.checksum_failures == 1
+    assert len(alive) >= 4  # every message, the heartbeat included, signals a live session
     assert books[0] is True and False in books and books[-1] is True
     assert trades[0]["price"] == Decimal("45280.1")  # Decimal, not float
 

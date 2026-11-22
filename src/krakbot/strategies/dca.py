@@ -14,11 +14,24 @@ from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from enum import StrEnum
 
 from krakbot.kraken_rest.models import Instrument
-from krakbot.numeric import floor_to_step, round_price_passive
+from krakbot.numeric import ceil_to_step, floor_to_step, round_price_passive
 
 __all__ = [
-    "DAY_MS", "HOUR_MS", "DcaPlan", "TrancheOutcome", "WaitReason", "WeekBudget", "closing_status", "entry_price",
-    "fee_for", "order_qty", "plan", "week_budget", "window_at",
+    "DAY_MS",
+    "HOUR_MS",
+    "DcaPlan",
+    "TrancheOutcome",
+    "WaitReason",
+    "WeekBudget",
+    "canary_budget",
+    "closing_status",
+    "entry_price",
+    "fee_for",
+    "min_qty",
+    "order_qty",
+    "plan",
+    "week_budget",
+    "window_at",
 ]
 
 HOUR_MS = 3_600_000
@@ -113,11 +126,25 @@ def order_qty(remaining: Decimal, price: Decimal, fee_rate: Decimal, inst: Instr
     return qty
 
 
+def min_qty(price: Decimal, inst: Instrument) -> Decimal:
+    """Kraken's absolute minimum order size at `price`: max(ordermin, costmin / price rounded UP to the lot)."""
+    return max(inst.ordermin, ceil_to_step(inst.costmin / price, inst.lot_step))
+
+
+def canary_budget(mid: Decimal, *, max_chase: Decimal, fee_rate: Decimal, inst: Instrument) -> Decimal:
+    """Budget of a LIVE canary tranche (plan §5.3): enough for ONE minimum-size order anywhere up to the chase cap,
+    fee included, rounded up to the cent. Never more: the canary must not be able to buy more than the minimum."""
+    cap = mid * (1 + max_chase)
+    cost = max(inst.ordermin * cap, inst.costmin + inst.lot_step * cap)
+    return (cost + fee_for(cost, fee_rate, inst)).quantize(_CENT, rounding=ROUND_UP)
+
+
 class WaitReason(StrEnum):
     NO_FRESH_BOOK = "no_fresh_book"
     CHASE_CAP = "chase_cap"
     SPREAD_PAUSE = "spread_pause"
     BELOW_MINIMUM = "below_minimum"
+    DMS_UNAVAILABLE = "dms_unavailable"      # LIVE: the dead man's switch could not be armed: no order
 
 
 class TrancheOutcome(StrEnum):

@@ -35,6 +35,38 @@ def _order(store, trade_id="t1", cl="c1", qty="0.01", role=OrderRole.ENTRY, side
                                price=Decimal("50000.0"), post_only=True)
 
 
+# ------------------------------------------------------------------ migration 0003 on existing data
+def test_migration_0003_keeps_halt_ref_and_tranches_and_allows_canary(tmp_path):
+    conn = connect(tmp_path / "m3.db")
+    try:
+        conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, "
+                     "checksum TEXT NOT NULL, applied_at INTEGER NOT NULL)")
+        for v in (1, 2):
+            m = next(x for x in _available() if x[0] == v)
+            for stmt in _split_sql(m[2]):
+                conn.execute(stmt)
+            conn.execute("INSERT INTO schema_migrations VALUES (?, ?, ?, 0)",
+                         (v, m[1], hashlib.sha256(m[2].encode()).hexdigest()))
+        conn.execute("INSERT INTO risk_state(strategy, mode, halted, halt_reason, halt_ref, updated_at) "
+                     "VALUES ('dca','dry_run',1,'unknown_order','cl-9',5)")
+        conn.execute("INSERT INTO trades(trade_id, strategy, mode, pair, state, qty_target, created_at, updated_at) "
+                     "VALUES ('dca-x','dca','dry_run','XBT/EUR','SIGNALLED','0',1,1)")
+        conn.execute("INSERT INTO dca_tranches(tranche_id, seq, mode, window_start, window_end, nominal, carry_in, "
+                     "budget, status, created_at, updated_at) VALUES ('dca-x',1,'dry_run',0,1,'19.23','0','19.23',"
+                     "'scheduled',1,1)")
+        with pytest.raises(sqlite3.IntegrityError):  # 'canary' not allowed before 0003
+            conn.execute("UPDATE risk_state SET halt_reason='canary'")
+        assert migrate(conn) == [3]
+        assert tuple(conn.execute("SELECT halted, halt_reason, halt_ref FROM risk_state").fetchone()) == (
+            1, "unknown_order", "cl-9")
+        assert conn.execute("SELECT canary FROM dca_tranches").fetchone()[0] == 0
+        conn.execute("UPDATE risk_state SET halt_reason='canary', halt_ref='dca-live-1'")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE dca_tranches SET canary = 2")
+    finally:
+        conn.close()
+
+
 # ------------------------------------------------------------------ migration 0002 on existing data
 def test_migration_0002_preserves_existing_risk_state(tmp_path):
     conn = connect(tmp_path / "m.db")
@@ -50,7 +82,7 @@ def test_migration_0002_preserves_existing_risk_state(tmp_path):
                      "VALUES ('donchian','dry_run',2,1,'daily',5)")
         with pytest.raises(sqlite3.IntegrityError):  # 'unknown_order' not allowed before 0002
             conn.execute("UPDATE risk_state SET halt_reason='unknown_order'")
-        assert migrate(conn) == [2]
+        assert migrate(conn) == [2, 3]
         r = conn.execute("SELECT consecutive_losses, halted, halt_reason FROM risk_state").fetchone()
         assert tuple(r) == (2, 1, "daily")
         conn.execute("UPDATE risk_state SET halt_reason='unknown_order', halt_ref='cl1'")

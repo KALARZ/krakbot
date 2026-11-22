@@ -1,0 +1,10 @@
+[Unit]
+Description=krakbot - daily database backup (00:20 UTC, after the daily spread rollup)
+
+[Timer]
+OnCalendar=*-*-* 00:20:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

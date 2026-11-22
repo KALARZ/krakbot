@@ -23,6 +23,7 @@ from krakbot.kraken_rest.errors import KrakenError, OutcomeUnknownError
 from krakbot.kraken_rest.models import Instrument
 from krakbot.market_data import MarketData
 from krakbot.monitor.alerts import AlertLevel, Alerts
+from krakbot.state.canary import CANARY_CLEAN_TRANCHES, CanaryRepo
 from krakbot.state.dca import DcaRepo, Tranche
 from krakbot.state.liquidity import LiquidityRepo
 from krakbot.state.repo import Order, Store
@@ -30,8 +31,11 @@ from krakbot.strategies.dca import (
     DcaPlan,
     TrancheOutcome,
     WaitReason,
+    canary_budget,
     closing_status,
     entry_price,
+    fee_for,
+    min_qty,
     order_qty,
     week_budget,
     window_at,
@@ -68,6 +72,7 @@ class DcaEngine:
         self._done_placing: set[str] = set()
         self._cooldown_until = 0
         self._announced_complete = False
+        self.canary = CanaryRepo(store)
 
     # ------------------------------------------------------------------ helpers
     def _dca_orders(self, statuses: tuple[OrderStatus, ...]) -> list[Order]:
@@ -111,8 +116,11 @@ class DcaEngine:
         await self._maintain_dms()
 
     async def _maintain_dms(self) -> None:
+        """LIVE (plan §5.2): armed whenever an order may rest on the book (working, in flight or ambiguous), so a
+        dead bot leaves nothing behind for more than `dms_timeout_seconds`; disarmed when nothing can rest."""
         if self.dms is not None:
-            await self.dms.maintain(entries_working=bool(self._working()), stops_resting=False)
+            may_rest = bool(self._working() or self._unresolved())
+            await self.dms.maintain(entries_working=may_rest, stops_resting=False)
 
     async def _intent_leftovers(self) -> None:
         """An INTENT order found at tick time means a crash between write-ahead and send: ambiguous by definition."""
@@ -197,12 +205,26 @@ class DcaEngine:
                 await self._alert(f"program complete: spent {spent} of {self.plan.total_budget} EUR")
             return
         tid = f"dca-{self.mode}-{start // 1000}"
+        budget, canary = w.budget, False
+        if self.mode == Mode.LIVE and not self.canary.phase_complete():
+            top = self.md.top(self.pair)
+            if top is None:
+                self.last_wait = WaitReason.NO_FRESH_BOOK
+                return  # the canary budget needs a real price; retry next tick (still inside the window)
+            canary = True
+            budget = min(w.budget, canary_budget(top.mid, max_chase=self.cfg.max_chase, fee_rate=self.fee_rate(),
+                                                 inst=self.inst))
         t = self.dca.create(tranche_id=tid, mode=self.mode, window_start=start, window_end=end, nominal=w.nominal,
-                            carry_in=w.carry_in, budget=w.budget)
-        if w.budget < min_cost:
+                            carry_in=w.carry_in, budget=budget, canary=canary)
+        if budget < min_cost:
             self.dca.close(tid, str(TrancheOutcome.SKIPPED_MIN))
-            await self._alert(f"tranche {t.seq} skipped: budget {w.budget} < Kraken minimum {min_cost:.4f} EUR",
+            await self._alert(f"tranche {t.seq} skipped: budget {budget} < Kraken minimum {min_cost:.4f} EUR",
                               AlertLevel.WARNING)
+            return
+        if canary:
+            await self._alert(f"CANARY tranche {t.seq} opened: ONE order of Kraken's minimum size, budget {budget} EUR "
+                              f"(clean canary streak {self.canary.streak()}/{CANARY_CLEAN_TRANCHES}). Watch it; "
+                              "`krakbot halt --mode live --reason ...` is ready.", AlertLevel.WARNING)
             return
         await self._alert(f"tranche {t.seq} opened: budget {w.budget} EUR (carry {w.carry_in})")
 
@@ -243,6 +265,11 @@ class DcaEngine:
         await self._alert(f"tranche {t.seq} {status}: spent {t.spent} EUR for {t.qty} BTC; carry {t.carry_out}",
                           level)
         self._done_placing.discard(t.tranche_id)
+        if t.canary:  # plan §5.3: nothing more is bought until the operator has verified this tranche
+            self.store.risk.halt(STRATEGY, self.mode, "canary", ref=t.tranche_id)
+            await self._alert(f"CANARY tranche {t.seq} closed ({status}, {t.qty} BTC for {t.spent} EUR). Purchases "
+                              f"halted until `krakbot canary-verify {t.tranche_id} --yes` checks fill, ledger, "
+                              "reconciliation and balance.", AlertLevel.CRITICAL)
         recent = self.dca.recent_closed(self.mode, self.cfg.stall_alert_weeks)
         if len(recent) == self.cfg.stall_alert_weeks and all(r.status == "unfilled" for r in recent):
             await self._alert(f"DCA_STALLED: {self.cfg.stall_alert_weeks} consecutive unfilled tranches",
@@ -264,10 +291,21 @@ class DcaEngine:
                 self.last_wait = WaitReason.SPREAD_PAUSE
                 return
         qty = order_qty(t.budget - t.spent, price, self.fee_rate(), self.inst)
+        if qty is not None and t.canary:
+            q_min = min_qty(price, self.inst)  # exactly Kraken's minimum, never more
+            fits = q_min * price + fee_for(q_min * price, self.fee_rate(), self.inst) <= t.budget - t.spent
+            qty = q_min if fits else None
         if qty is None:
             self.last_wait = WaitReason.BELOW_MINIMUM
             self._done_placing.add(t.tranche_id)
             return
+        if self.dms is not None:  # arm BEFORE the send: a crash right after AddOrder must not leave a resting buy
+            await self.dms.maintain(entries_working=True, stops_resting=False)
+            if not self.dms.armed:
+                self.last_wait = WaitReason.DMS_UNAVAILABLE
+                await self._alert("dead man's switch could not be armed: no order sent", AlertLevel.WARNING,
+                                  key="dms-unavailable", repeat_after_s=900)
+                return
         self.last_wait = None
         attempt = len(self.store.orders.for_trade(t.tranche_id))
         cl = str(uuid.uuid5(_NS, f"{t.tranche_id}:{attempt}"))

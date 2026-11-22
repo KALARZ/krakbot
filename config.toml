@@ -53,8 +53,12 @@ heartbeat_seconds = 60
 ws_down_alert_seconds = 30
 
 [live_gate]
-dry_run_clean_days = 7            # DCA live only after >= 7 consecutive clean DRY_RUN days
-min_heartbeat_coverage = "0.99"
+# PRE-REGISTERED clean UTC day (plan §5.1, src/krakbot/state/gates.py): uptime >= 99%, no DCA halt at any moment,
+# >= 90% of the expected 10-s book samples for EVERY sample pair, >= 1 reconciliation and none failed, no unclean
+# exit, DCA in dry_run. Only these values are accepted; liquidity thresholds come only from a window of clean days.
+dry_run_clean_days = 7            # DCA live only after 7 consecutive clean DRY_RUN days
+min_heartbeat_coverage = "0.99"   # uptime
+min_sample_coverage = "0.90"      # per sample pair, per day
 
 [strategies.dca]
 mode = "dry_run"                  # off | dry_run | live
@@ -71,6 +75,7 @@ stall_alert_weeks = 4            # consecutive UNFILLED weeks -> DCA_STALLED ale
 min_tranche_safety_factor = "1.5" # startup: tranche must be >= 1.5 x max(ordermin*price, costmin), else fewer tranches
 pause_spread_percentile = 99      # no NEW DCA order while spread > p99 of XBT/EUR 7-day samples (once derived)
 kill_switch_sells_holdings = false  # confirmed decision: drawdown kill switches never sell DCA BTC (plan §6)
+canary_clean_tranches = 3         # LIVE canary (plan §5.3): min-size tranches, verified one by one, until 3 clean in a row
 
 [strategies.donchian]
 mode = "dry_run"                  # forward test only: "live" is rejected by the validator

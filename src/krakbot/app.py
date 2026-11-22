@@ -35,6 +35,7 @@ from krakbot.market_data import LiquiditySampler, MarketData
 from krakbot.monitor.alerts import AlertLevel, Alerts, NullAlerts
 from krakbot.monitor.heartbeat import ExternalPing, sd_notify
 from krakbot.state import connect, migrate
+from krakbot.state.canary import CanaryRepo
 from krakbot.state.dca import DcaRepo
 from krakbot.state.gates import dca_live_gate
 from krakbot.state.liquidity import LiquidityRepo
@@ -45,6 +46,7 @@ __all__ = ["DRY_RUN_MAKER_FEE", "App", "LiveGateError"]
 
 log = logging.getLogger("krakbot.app")
 DRY_RUN_MAKER_FEE = Decimal("0.0040")  # Tier 1 maker, pre-registered for DRY_RUN (plan §0.1)
+WATCHDOG_EVERY_MS = 10_000  # systemd WatchdogSec=120 (deploy/systemd): 12 missed pings before a restart
 DCA_PAIR = "XBT/EUR"
 
 
@@ -64,7 +66,7 @@ class App:
         self.alerts: Alerts = alerts or NullAlerts()
         self.run_id = str(uuid.uuid4())
         self.mode = Mode.LIVE if live else Mode.DRY_RUN
-        self._last = {"heartbeat": 0, "recon": 0, "fee": 0, "rest_fallback": 0, "asset_pairs": 0}
+        self._last = {"heartbeat": -1, "watchdog": 0, "recon": 0, "fee": 0, "rest_fallback": 0, "asset_pairs": 0}
         self.loop_errors = 0
         self.healthy = False
 
@@ -90,7 +92,7 @@ class App:
         self.sampler = LiquiditySampler(self.md, self.liq, list(self.instruments),
                                         sample_seconds=self.s.app.liquidity.sample_seconds, now_ms=self.now)
         self.ws = PublicWs(self.md.ws_symbols, on_book=self.md.on_book, on_trade=self.md.on_trades,
-                           connect=self.ws_connect)
+                           on_alive=self.md.on_ws_alive, connect=self.ws_connect)
         self.dca = DcaRepo(self.store, DCA_PAIR)
         await self._build_engine()
         self.ping = ExternalPing(self.http, sec.HEALTHCHECK_URL)
@@ -136,6 +138,11 @@ class App:
             await dms.disarm()  # plan §4.6 step 4: never let a stale timer cancel what recovery is about to place
             broker = KrakenBroker(self.private, self.instruments, now_ms=self.now)
             await self._refresh_fee()
+            # plan §5.3: the balance check of every canary is (balance - baseline) == bought qty
+            bal = await self.private.balance_ex()
+            base = CanaryRepo(self.store).set_baseline_once(
+                self.inst.base, bal.get(self.inst.base, {}).get("balance", Decimal(0)), self.run_id)
+            log.warning("live baseline", extra={"asset": self.inst.base, "baseline": str(base)})
         else:
             broker = PaperBroker(self.md, self.instruments, fee_rate=DRY_RUN_MAKER_FEE, now_ms=self.now)
         self.broker = broker
@@ -149,10 +156,14 @@ class App:
             raise LiveGateError("config [strategies.dca].mode is not 'live'")
         if not (self.s.secrets.has_kraken_keys and self.s.secrets.KRAKBOT_LIVE_ENABLED):
             raise LiveGateError("live requires Kraken keys and KRAKBOT_LIVE_ENABLED=true")
-        g = dca_live_gate(self.conn, self.now(), days=self.s.app.live_gate.dry_run_clean_days,
-                          min_coverage=self.s.app.live_gate.min_heartbeat_coverage)
+        if self.store.events.by_kind("LIVE_UNLOCKED"):
+            return  # the 7-day gate is a one-time unlock: later LIVE restarts (crash, deploy) must not be refused
+        g = dca_live_gate(self.conn, self.now(), pairs=list(self.s.app.liquidity.sample_pairs))
         if not g.allowed:
             raise LiveGateError("7-day DRY_RUN gate not passed: " + "; ".join(g.reasons[:10]))
+        self.store.events.append("LIVE_UNLOCKED", EventLevel.CRITICAL,
+                                 {"window": list(g.window), "days": [d.day_start_ms for d in g.days]},
+                                 strategy="dca", mode=Mode.LIVE)
 
     async def _refresh_fee(self) -> None:
         if self.private is None:
@@ -222,10 +233,16 @@ class App:
             log.exception("main loop error")
             await self.alerts.send(f"main loop error: {type(exc).__name__}: {exc}", level=AlertLevel.CRITICAL,
                                    key=f"loop:{type(exc).__name__}", repeat_after_s=900)
-        if now - self._last["heartbeat"] >= 60_000 and self.healthy:
-            self._last["heartbeat"] = now
-            self.store.runs.heartbeat(self.run_id)  # only healthy minutes count for the live gate
-            sd_notify("WATCHDOG=1")
+        # systemd watchdog = the loop is alive (NOT market health: a Kraken WS outage must not cause restart loops)
+        if now - self._last["watchdog"] >= WATCHDOG_EVERY_MS:
+            self._last["watchdog"] = now
+            sd_notify(f"WATCHDOG=1\nSTATUS={'healthy' if self.healthy else 'degraded (no fresh WS book)'}")
+        # uptime of the clean-day rule: one mark per UTC minute in which the loop ran healthy at least once
+        # (minute-aligned: a ">= 60 s since the last write" rule would skip ~1 minute in 60 and fail every day)
+        minute = now // 60_000
+        if self.healthy and minute != self._last["heartbeat"]:
+            self._last["heartbeat"] = minute
+            self.store.runs.heartbeat(self.run_id)
             await self.ping.ping()
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -242,6 +259,7 @@ class App:
                 await ws_task
 
     async def close(self, *, clean: bool, reason: str) -> None:
+        sd_notify("STOPPING=1")
         self.store.runs.end(self.run_id, clean=clean, reason=reason)
         await self.alerts.send(f"stopped ({reason})", level=AlertLevel.WARNING if not clean else AlertLevel.INFO)
         self.conn.close()

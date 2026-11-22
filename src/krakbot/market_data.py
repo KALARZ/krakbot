@@ -55,6 +55,7 @@ class MarketData:
         self._stale = stale_after_ms
         self._tops: dict[str, Top] = {}
         self._trade_listeners: list[TradeListener] = []
+        self._ws_alive_ms = 0
 
     def update_instruments(self, instruments: Mapping[str, Instrument]) -> None:
         """Daily AssetPairs refresh: precisions/minimums only (the WS symbol set is fixed for the process)."""
@@ -85,9 +86,19 @@ class MarketData:
         self._tops[pair] = Top(pair, bp, bq, ap, aq, self._now(), "ws", depth[0] if depth else None,
                                depth[1] if depth else None)
 
+    def on_ws_alive(self) -> None:
+        """A WS message arrived (any channel, heartbeat included). A valid, checksum-verified book that simply did not
+        change is still the current book: quiet pairs must not look stale (that would bias sampling toward busy
+        moments). Disconnects and checksum failures invalidate books explicitly via on_book(symbol, None)."""
+        self._ws_alive_ms = self._now()
+
+    def _age(self, t: Top) -> int:
+        ref = max(t.ts_ms, self._ws_alive_ms) if t.source == "ws" else t.ts_ms
+        return self._now() - ref
+
     def on_rest_ticker(self, pair: str, t: BookTop) -> None:
         cur = self._tops.get(pair)
-        if cur is not None and cur.source == "ws" and self._now() - cur.ts_ms < self._stale:
+        if cur is not None and cur.source == "ws" and self._age(cur) <= self._stale:
             return  # a fresh WS book always wins over REST
         self._tops[pair] = Top(pair, t.bid, None, t.ask, None, self._now(), "rest", None, None)
 
@@ -101,7 +112,7 @@ class MarketData:
     # ---- outputs
     def top(self, pair: str, *, require_ws: bool = False) -> Top | None:
         t = self._tops.get(pair)
-        if t is None or self._now() - t.ts_ms > self._stale:
+        if t is None or self._age(t) > self._stale:
             return None
         if require_ws and t.source != "ws":
             return None
@@ -109,7 +120,7 @@ class MarketData:
 
     def needs_rest_fallback(self, pair: str) -> bool:
         t = self._tops.get(pair)
-        return t is None or self._now() - t.ts_ms > self._stale
+        return t is None or self._age(t) > self._stale
 
 
 class LiquiditySampler:

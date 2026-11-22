@@ -78,7 +78,7 @@ async def test_place_is_post_only_gtd_with_deadline_and_client_id(client, now):
     upd = await broker(client, now).place_post_only_buy(req())
     assert upd.status == OrderStatus.OPEN and upd.txid == "OABC-1"
     f = form(route.calls.last.request)
-    assert f["oflags"] == "post" and f["timeinforce"] == "GTD" and f["expiretm"] == "+300"
+    assert f["oflags"] == "post,fciq" and f["timeinforce"] == "GTD" and f["expiretm"] == "+300"
     assert f["cl_ord_id"] == CL and f["type"] == "buy" and f["ordertype"] == "limit" and "deadline" in f
     assert f["pair"] == "XBTEUR" and f["volume"] == "0.00034470" and f["price"] == "55566.8"
 

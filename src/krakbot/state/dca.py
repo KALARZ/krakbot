@@ -39,6 +39,7 @@ class Tranche:
     ref_mid: Decimal | None
     status: str
     carry_out: Decimal | None
+    canary: bool = False
 
     @property
     def remaining(self) -> Decimal:
@@ -48,7 +49,7 @@ class Tranche:
     def from_row(cls, r: sqlite3.Row) -> Tranche:
         return cls(r["tranche_id"], r["seq"], Mode(r["mode"]), r["window_start"], r["window_end"], D(r["nominal"]),
                    D(r["carry_in"]), D(r["budget"]), D(r["spent"]), D(r["qty"]), D(r["fees"]), from_db(r["ref_mid"]),
-                   r["status"], from_db(r["carry_out"]))
+                   r["status"], from_db(r["carry_out"]), bool(r["canary"]))
 
 
 class DcaRepo:
@@ -58,7 +59,7 @@ class DcaRepo:
         self._pair = pair
 
     def create(self, *, tranche_id: str, mode: Mode, window_start: int, window_end: int, nominal: Decimal,
-               carry_in: Decimal, budget: Decimal) -> Tranche:
+               carry_in: Decimal, budget: Decimal, canary: bool = False) -> Tranche:
         if budget <= 0 or nominal < 0 or carry_in < 0:
             raise StateError("budget must be > 0, nominal and carry_in >= 0")
         if budget > nominal + carry_in:
@@ -69,9 +70,9 @@ class DcaRepo:
             self._s.trades.create(tranche_id, strategy="dca", mode=mode, pair=self._pair, qty_target=Decimal(0))
             self._c.execute(
                 "INSERT INTO dca_tranches(tranche_id, seq, mode, window_start, window_end, nominal, carry_in, budget, "
-                "status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "status, created_at, updated_at, canary) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (tranche_id, seq, str(mode), window_start, window_end, nominal, carry_in, budget, "scheduled", now,
-                 now))
+                 now, int(canary)))
         return self.get(tranche_id)
 
     def get(self, tranche_id: str) -> Tranche:

@@ -1,6 +1,7 @@
 """CLI (status / halt / resume / resolve / gate / liquidity-derive) and an App start-step-close smoke test."""
 
 import io
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
@@ -15,7 +16,9 @@ from krakbot.domain import Mode, OrderRole, OrderStatus, OrderType, Side
 from krakbot.kraken_rest.errors import OutcomeUnknownError
 from krakbot.kraken_ws import OrderBook
 from krakbot.monitor.alerts import MemoryAlerts
-from krakbot.state import connect
+from krakbot.state import connect, migrate
+from krakbot.state.canary import CanaryRepo
+from krakbot.state.gates import GateResult
 from krakbot.state.repo import Store
 from tests.unit.dca_harness import MONDAY_10, make
 
@@ -219,3 +222,116 @@ async def test_app_refreshes_kraken_minimums_every_24h(cfg_dir):
         finally:
             ASSET_PAIRS["XXBTZEUR"]["ordermin"] = "0.00006"
             await app.close(clean=True, reason="test")
+
+
+@respx.mock
+async def test_app_live_wiring_records_the_balance_baseline_once_and_disarms_the_dms(cfg_dir, monkeypatch):
+    """LIVE wiring with Kraken mocked (the gate itself is tested in test_gates): no order is placed here."""
+    _mock_public()
+    priv = "https://api.kraken.com/0/private/"
+    dms = respx.post(priv + "CancelAllOrdersAfter").mock(return_value=httpx.Response(200, json={
+        "error": [], "result": {"currentTime": "x", "triggerTime": "0"}}))
+    respx.post(priv + "TradeVolume").mock(return_value=httpx.Response(200, json={"error": [], "result": {
+        "fees_maker": {"XXBTZEUR": {"fee": "0.2500"}}}}))
+    respx.post(priv + "BalanceEx").mock(return_value=httpx.Response(200, json={"error": [], "result": {
+        "XXBT": {"balance": "0.12345678", "hold_trade": "0"}}}))
+    (cfg_dir / ".env").write_text("CAPITAL=5000\nKRAKEN_API_KEY=TESTKEY-NOT-REAL-0123456789\nKRAKEN_API_SECRET="
+                                  "kQH5HW/8p1uGOVjbgWA7FunAmGO8lsSUXNsu3eow76sz84Q18fWxnyRzBHCd3pd5nE9qa99HAZtuZuj6F1huXg=="
+                                  "\nKRAKBOT_LIVE_ENABLED=true\n")
+    cfg = (cfg_dir / "config.toml").read_text().replace('mode = "dry_run"                  # off | dry_run | live',
+                                                         'mode = "live"', 1)
+    (cfg_dir / "config.toml").write_text(cfg)
+    settings = load_settings(cfg_dir / "config.toml", cfg_dir / ".env")
+    monkeypatch.setattr(App, "_check_live_allowed", lambda self: None)
+    now = {"t": MONDAY_10 - 3_600_000}
+    for balance_seen in ("0.12345678", "0.99"):
+        async with httpx.AsyncClient() as http:
+            app = App(settings, live=True, http=http, now_ms=lambda: now["t"], alerts=MemoryAlerts(lambda: now["t"]))
+            await app.start()
+            assert app.engine is not None and app.engine.dms is not None and app._fee == Decimal("0.0025")
+            assert CanaryRepo(app.store).baseline("XXBT") == Decimal("0.12345678")  # first start only
+            await app.close(clean=True, reason="test")
+        respx.post(priv + "BalanceEx").mock(return_value=httpx.Response(200, json={"error": [], "result": {
+            "XXBT": {"balance": balance_seen, "hold_trade": "0"}}}))
+    assert [dict(urllib.parse.parse_qsl(c.request.content.decode()))["timeout"] for c in dms.calls] == ["0", "0"]
+    assert not any("AddOrder" in str(c.request.url) for c in respx.calls)
+
+
+
+@respx.mock
+async def test_heartbeat_marks_every_healthy_minute_and_watchdog_ignores_market_health(cfg_dir, monkeypatch):
+    _mock_public()
+    sent = []
+    monkeypatch.setattr("krakbot.app.sd_notify", lambda state: sent.append(state) or True)
+    settings = load_settings(cfg_dir / "config.toml", cfg_dir / ".env")
+    now = {"t": MONDAY_10 - 3_600_000}
+    async with httpx.AsyncClient() as http:
+        app = App(settings, live=False, http=http, now_ms=lambda: now["t"], alerts=MemoryAlerts(lambda: now["t"]))
+        await app.start()
+        for _ in range(3 * 3600):  # 3 hours of 1.0x-second loop steps with a slowly drifting period
+            now["t"] += 1_003
+            b = OrderBook("BTC/EUR", 10)
+            b.snapshot([{"price": Decimal("55566.8"), "qty": Decimal("1")}],
+                       [{"price": Decimal("55597.9"), "qty": Decimal("1")}])
+            app.md.on_book("BTC/EUR", b)
+            await app.step()
+        minutes = app.store.conn.execute("SELECT MIN(minute), MAX(minute), COUNT(*) FROM heartbeats").fetchone()
+        assert minutes[2] == minutes[1] - minutes[0] + 1  # no gap: every minute counted
+        healthy_pings = sum(1 for x in sent if x.startswith("WATCHDOG=1"))
+        app.md.on_book("BTC/EUR", None)  # WS book lost: degraded, yet the watchdog keeps being fed
+        for _ in range(120):
+            now["t"] += 1_000
+            await app.step()
+        assert not app.healthy
+        assert sum(1 for x in sent if x.startswith("WATCHDOG=1")) >= healthy_pings + 11
+        assert any("degraded" in x for x in sent)
+        assert app.store.conn.execute("SELECT COUNT(*) FROM heartbeats").fetchone()[0] == minutes[2]
+        await app.close(clean=True, reason="test")
+    assert sent[0] == "READY=1" and sent[-1] == "STOPPING=1"
+
+
+
+async def test_backup_is_consistent_and_never_overwrites(h, tmp_path):
+    await h.tick()
+    dest = tmp_path / "bk" / "copy.db"
+    dest.parent.mkdir()
+    code, out = cli(h, "backup", str(dest))
+    assert code == EXIT_OK and "integrity_check: ok" in out and oct(dest.stat().st_mode & 0o777) == "0o600"
+    c = connect(dest)
+    try:
+        assert c.execute("SELECT COUNT(*) FROM dca_tranches").fetchone()[0] == 1
+    finally:
+        c.close()
+    code, out = cli(h, "backup", str(dest))
+    assert code == EXIT_REFUSED and "never overwritten" in out
+
+
+
+async def test_live_gate_is_a_one_time_unlock(cfg_dir, monkeypatch):
+    (cfg_dir / ".env").write_text("CAPITAL=5000\nKRAKEN_API_KEY=TESTKEY-NOT-REAL-0123456789\nKRAKEN_API_SECRET="
+                                  "kQH5HW/8p1uGOVjbgWA7FunAmGO8lsSUXNsu3eow76sz84Q18fWxnyRzBHCd3pd5nE9qa99HAZtuZuj6F1huXg=="
+                                  "\nKRAKBOT_LIVE_ENABLED=true\n")
+    cfg = (cfg_dir / "config.toml").read_text().replace('mode = "dry_run"                  # off | dry_run | live',
+                                                         'mode = "live"', 1)
+    (cfg_dir / "config.toml").write_text(cfg)
+    settings = load_settings(cfg_dir / "config.toml", cfg_dir / ".env")
+    verdict = {"allowed": False}
+
+    def fake_gate(conn, now_ms, *, pairs, rule=None, current_run_id=None):
+        return GateResult(verdict["allowed"], [] if verdict["allowed"] else ["day 1: not clean"], [], (0, 1))
+
+    monkeypatch.setattr("krakbot.app.dca_live_gate", fake_gate)
+    async with httpx.AsyncClient() as http:
+        app = App(settings, live=True, http=http)
+        app.conn = connect(settings.db_path)
+        migrate(app.conn)
+        app.store = Store(app.conn, app.now)
+        with pytest.raises(LiveGateError):
+            app._check_live_allowed()
+        verdict["allowed"] = True
+        app._check_live_allowed()  # first pass: unlock recorded
+        assert len(app.store.events.by_kind("LIVE_UNLOCKED")) == 1
+        verdict["allowed"] = False  # e.g. the window now contains LIVE runs
+        app._check_live_allowed()   # a restart after the unlock is not refused
+        assert len(app.store.events.by_kind("LIVE_UNLOCKED")) == 1
+        app.conn.close()

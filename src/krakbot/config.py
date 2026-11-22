@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, f
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from krakbot.domain import Mode
+from krakbot.state.gates import CLEAN_DAY_RULE
 
 __all__ = [
     "FREEZE_EXCLUDED", "FREEZE_FROZEN", "AppConfig", "ConfigError", "Secrets", "Settings", "check_env_file_permissions",
@@ -139,8 +140,20 @@ class Monitor(_Strict):
 
 
 class LiveGate(_Strict):
-    dry_run_clean_days: int = Field(ge=7, le=90)  # user: DCA live only after 7 clean DRY_RUN days (>= 7 enforced)
-    min_heartbeat_coverage: Dec = Field(ge=Decimal("0.90"), le=1)
+    """Pre-registered clean-day rule (state/gates.py, plan §5.1): only the registered values are accepted."""
+
+    dry_run_clean_days: int
+    min_heartbeat_coverage: Dec
+    min_sample_coverage: Dec
+
+    @model_validator(mode="after")
+    def _registered(self) -> LiveGate:
+        r = CLEAN_DAY_RULE
+        got = (self.dry_run_clean_days, self.min_heartbeat_coverage, self.min_sample_coverage)
+        if got != (r.days, r.min_uptime, r.min_sample_coverage):
+            raise ValueError(f"live_gate is pre-registered: dry_run_clean_days={r.days}, "
+                             f"min_heartbeat_coverage={r.min_uptime}, min_sample_coverage={r.min_sample_coverage}")
+        return self
 
 
 class Dca(_Strict):
@@ -158,6 +171,14 @@ class Dca(_Strict):
     min_tranche_safety_factor: Dec = Field(ge=1, le=5)
     pause_spread_percentile: int = Field(ge=90, le=100)
     kill_switch_sells_holdings: bool = False  # confirmed off: kill switches never sell DCA holdings (plan §6)
+    canary_clean_tranches: int = 3  # pre-registered LIVE canary (plan §5.3): min size until 3 clean tranches in a row
+
+    @field_validator("canary_clean_tranches")
+    @classmethod
+    def _canary_registered(cls, v: int) -> int:
+        if v != 3:
+            raise ValueError("canary_clean_tranches is pre-registered at 3 (plan §5.3)")
+        return v
 
     @model_validator(mode="after")
     def _dd_bound(self) -> Dca:
@@ -239,6 +260,15 @@ class AppConfig(_Strict):
     def _capital_split(self) -> AppConfig:
         if self.strategies.dca.allocation + self.strategies.donchian.paper_capital_fraction > 1:
             raise ValueError("dca.allocation + donchian.paper_capital_fraction must be <= 1")
+        return self
+
+    @model_validator(mode="after")
+    def _sampling_matches_clean_day_rule(self) -> AppConfig:
+        r = CLEAN_DAY_RULE  # the clean-day sample count and the threshold eligibility use the registered grid
+        liq = self.liquidity
+        if liq.sample_seconds != r.sample_seconds or liq.min_sample_coverage != r.min_sample_coverage:
+            raise ValueError(f"liquidity.sample_seconds={r.sample_seconds} and liquidity.min_sample_coverage="
+                             f"{r.min_sample_coverage} are pre-registered (clean-day rule)")
         return self
 
 
